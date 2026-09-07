@@ -98,6 +98,14 @@ IOC 同步响应明确成交后才推进下一腿。网络超时、5xx 或异常
 
 统计范围是**本次进程启动以来**，跨轮累加，重启清零；状态检查点保留本次统计快照，`logs/legs.csv` 继续保存实际成交数量与均价供事后核对。通过订单状态补确认的成交会尝试读取真实成交明细计算均价；均价仍缺失时，面板标记“合计不完整”并列出缺少均价的已成交数量，不使用挂价或滑点保护价代替成交价。
 
+## 余额与本次策略净盈亏
+
+仪表盘显示 Entropy 余额、权益、可提取金额，以及本次运行的策略总净盈亏：`已实现盈亏 - 实际手续费 + 资金费收支 + 当前持仓浮盈亏`。资金费收入为正、支出为负。盈亏跨轮次累计，重启归零；只统计本程序 LEG2/LEG4 订单及当前品种，RH 虚拟腿、转入转出不计入盈亏。手续费取实际成交记录（已含 builder fee），不使用配置费率估算。
+
+普通账户显示 `io USDC` 保证金余额；统一账户/组合保证金账户显示 `shared USDC` 共享 USDC 余额，其他抵押资产不折算入该值，也不把现货 hold 推算为可提取金额。余额通过实时账户接口读取，浮盈亏取所选 Entropy 仓位。
+
+`logging.account_refresh_sec` 控制只读刷新间隔，默认 10 秒。成交明细延迟、缺失订单 ID、账户持仓尚未同步时，净盈亏显示“暂无数据 / 同步中”；刷新失败保留上次余额并标记“数据过期”。退出平仓完成后再刷新并保留最终仪表盘。仅采集模式配置 `HL_ACCOUNT_ADDRESS` 后可显示余额，策略盈亏不适用。API 依据：[账户与资金费](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals)、[统一账户余额](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot)。
+
 ## 验证
 
 ```bash

@@ -25,6 +25,7 @@ from typing import Optional
 import aiohttp
 
 from .book import OrderBook
+from .accounting import number
 from .config import VenueConf
 from .feeds import HLBookFeed
 
@@ -258,7 +259,7 @@ class HLVenue:
                 if terminal and math.isfinite(filled) and 0 <= filled <= qty:
                     avg = await self._fill_average(inner.get("oid"), filled) if filled > 0 else None
                     return {"status": status, "filled_base": filled,
-                            "avg_px": avg, "err": None, "unresolved": False}
+                            "avg_px": avg, "oid": inner.get("oid"), "err": None, "unresolved": False}
             await asyncio.sleep(0.5)
         return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
                 "err": f"cloid={cloid.to_raw()}", "unresolved": True}
@@ -349,7 +350,7 @@ class HLVenue:
             if not (math.isfinite(filled) and filled > 0 and math.isfinite(avg) and avg > 0):
                 return unknown("invalid fill values")
             return {"status": "filled", "filled_base": filled, "avg_px": avg,
-                    "err": None, "unresolved": False}
+                    "oid": f.get("oid"), "err": None, "unresolved": False}
         if "error" in st:
             msg = str(st["error"])
             if "could not immediately match" in msg.lower():
@@ -368,6 +369,72 @@ class HLVenue:
             return self.account.query_address
         c = self.conf.hl_creds
         return c.account_address.lower() if c and c.account_address else None
+
+    async def fetch_history(self, kind, start_ms, end_ms=None):
+        """Paginate inclusive time ranges; refuse a saturated timestamp."""
+        end_ms = int(time.time() * 1000) if end_ms is None else end_ms
+        rows = []
+        while start_ms <= end_ms:
+            payload = {"type": kind, "user": self._query_address(),
+                       "startTime": start_ms, "endTime": end_ms}
+            if kind == "userFillsByTime":
+                payload["aggregateByTime"] = False
+            page = await self._info(payload)
+            if not isinstance(page, list):
+                raise ValueError("Malformed account history")
+            if not page:
+                break
+            latest = max(int(row["time"]) for row in page)
+            if any(not start_ms <= int(row["time"]) <= end_ms for row in page):
+                raise ValueError("Account history outside requested range")
+            # API time queries return at most 500 elements or distinct blocks.
+            # A short nonempty page is not sufficient evidence of completion.
+            if latest == start_ms:
+                if len(page) >= 500:
+                    raise ValueError("Account history timestamp saturated")
+                rows.extend(page)
+                start_ms += 1
+            else:
+                rows.extend(row for row in page if int(row["time"]) < latest)
+                start_ms = latest
+        return rows
+
+    async def fetch_account_snapshot(self):
+        addr = self._query_address()
+        if addr is None:
+            return None
+        mode, state = await asyncio.gather(
+            self._info({"type": "userAbstraction", "user": addr}),
+            self._info({"type": "clearinghouseState", "user": addr, "dex": self.conf.hl_dex}))
+        if not isinstance(state, dict) or not isinstance(state.get("assetPositions"), list):
+            raise ValueError("Malformed Entropy account state")
+        position = unrealized = number(0)
+        for item in state["assetPositions"]:
+            pos = item["position"]
+            if pos["coin"] == self.coin:
+                position, unrealized = number(pos["szi"]), number(pos["unrealizedPnl"])
+        if mode in ("unifiedAccount", "portfolioMargin"):
+            spot = await self._info({"type": "spotClearinghouseState", "user": addr})
+            if not isinstance(spot, dict) or not isinstance(spot.get("balances"), list):
+                raise ValueError("Malformed unified account balances")
+            balances = [b for b in spot["balances"] if b["token"] == 0]
+            balance = number(balances[0]["total"]) if balances else number(0)
+            # Spot holds are not withdrawable margin; don't label them as free funds.
+            equity = free = None
+            scope = "shared USDC"
+        elif mode in ("default", "disabled", "dexAbstraction"):
+            balance_state = state
+            if mode == "dexAbstraction":
+                balance_state = await self._info({"type": "clearinghouseState", "user": addr, "dex": ""})
+            summary = balance_state["marginSummary"]
+            balance = number(summary["totalRawUsd"])
+            equity = number(summary["accountValue"])
+            free = number(balance_state["withdrawable"])
+            scope = "shared perps USDC" if mode == "dexAbstraction" else "io USDC"
+        else:
+            raise ValueError(f"Unknown account abstraction mode: {mode}")
+        return dict(balance=balance, equity=equity, free=free, scope=scope,
+                    position=position, unrealized=unrealized)
 
     async def fetch_equity(self):
         """Unified account equity via the portfolio endpoint — the same

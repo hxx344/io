@@ -30,6 +30,7 @@ def test_full_and_partial_fill_response():
     result = HLVenue._parse({"status": "ok", "response": {"data": {"statuses": [
         {"filled": {"totalSz": "0.3", "avgPx": "103.1", "oid": 11}}]}}})
     assert result["filled_base"] == .3 and result["avg_px"] == 103.1
+    assert result["oid"] == 11
     assert not result["unresolved"]
 
 

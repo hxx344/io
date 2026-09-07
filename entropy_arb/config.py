@@ -77,6 +77,7 @@ class Config:
     recorder_csv: str = "logs/minutes.csv"
     log_level: str = "INFO"
     status_interval_sec: float = 30.0
+    account_refresh_sec: float = 10.0
     trades_csv: str = "logs/legs.csv"
     state_file: str = "logs/cycle.json"
     dashboard: bool = True
@@ -108,6 +109,7 @@ _SCHEMA = {
         "staleness_sec": float, "reconcile_sec": float, "http_keepalive_sec": float}.items()},
     "recorder": {"enabled": ("recorder_enabled", bool), "csv": ("recorder_csv", str)},
     "logging": {"level": ("log_level", str), "status_interval_sec": ("status_interval_sec", float),
+                "account_refresh_sec": ("account_refresh_sec", float),
                 "trades_csv": ("trades_csv", str), "dashboard": ("dashboard", bool),
                 "file": ("log_file", str)},
     "entropy": {"dex": ("hl_dex", str), "taker_fee_bps": ("fee_bps", float),
@@ -162,7 +164,7 @@ def load_config(config_file="config.yaml", env_file=".env", *,
     for key in ("virtual_depth", "virtual_requote_sec", "order_notional", "max_order_notional",
                 "min_order_notional", "settle_timeout_sec", "max_order_attempts", "retry_delay_sec",
                 "rate_limit_pause_sec", "staleness_sec", "reconcile_sec", "http_keepalive_sec",
-                "status_interval_sec"):
+                "status_interval_sec", "account_refresh_sec"):
         if getattr(cfg, key) <= 0:
             raise ConfigError(f"{key} must be > 0")
     for key in ("leg_slippage_bps", "leg2_slippage_bps", "leg4_slippage_bps"):

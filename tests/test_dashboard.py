@@ -42,3 +42,39 @@ def test_dashboard_displays_real_turnover_and_missing_price(eng):
     eng._account_turnover("LEG4", .1, None)
     assert "合计不完整" in render(eng, "zh")
     assert "Incomplete" in render(eng)
+
+
+def test_balance_and_net_pnl_bilingual_with_stale_state(eng):
+    import time
+    from decimal import Decimal as D
+    from test_accounting import snapshot
+    eng.markets_ready = True
+    stats = eng.account_stats
+    stats.snapshot = snapshot(unrealized="-2")
+    stats.snapshot_revision = stats.revision
+    stats.updated_at = time.monotonic()
+    stats.realized, stats.fees, stats.funding = D("5"), D(".5"), D("-.1")
+    for lang, words in (("zh", ("Entropy 余额", "1,000.00 USDC", "本次策略总净盈亏", "$+2.40", "手续费")),
+                        ("en", ("Entropy balance", "Session strategy net PnL", "$+2.40", "Funding"))):
+        text = render(eng, lang)
+        for word in words:
+            assert word in text
+    stats.error = "offline"
+    assert "数据过期" in render(eng, "zh")
+    assert "暂无数据 / 同步中" in render(eng, "zh")
+    assert "$+2.40" not in render(eng)
+
+
+def test_dashboard_survives_stop_until_final_close(eng):
+    import asyncio
+    from unittest.mock import patch
+    async def scenario():
+        eng.request_stop()
+        dash = Dashboard(eng, None, "unused")
+        with patch("entropy_arb.dashboard.Live"):
+            task = asyncio.create_task(dash.run())
+            await asyncio.sleep(.01)
+            assert not task.done()
+            eng.finished.set()
+            await asyncio.wait_for(task, 1)
+    asyncio.run(scenario())

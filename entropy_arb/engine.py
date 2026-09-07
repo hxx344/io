@@ -14,6 +14,7 @@ from pathlib import Path
 import aiohttp
 
 from .book import floor_step
+from .accounting import SessionAccount
 from .config import Config
 from .journal import CycleJournal
 from .recorder import MinuteRecorder
@@ -31,6 +32,8 @@ class Engine:
         self.entropy = self.hedge = self.session = None
         self.venues = {}
         self.stop = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.account_stats = SessionAccount()
         self._feed_stop = asyncio.Event()
         self._update_evt = asyncio.Event()
         self.markets_ready = False
@@ -127,6 +130,9 @@ class Engine:
                 if await self.entropy.fetch_open_orders():
                     self._halt("Entropy has pre-existing open orders for this symbol")
                 self._save()
+            if self.entropy._query_address():
+                await self._refresh_account()
+                tasks.append(asyncio.create_task(self._account_loop()))
             for venue in self.venues.values():
                 tasks += venue.start_tasks(self._feed_stop, self._update_evt.set, live=False)
             if self.cfg.recorder_enabled or self.record_only:
@@ -147,11 +153,33 @@ class Engine:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self.entropy and self.entropy._query_address():
+                await self._refresh_account()
             for venue in self.venues.values():
                 await venue.close()
             await self.session.close()
             self._journal.close()
             self._log_turnover()
+            self.finished.set()
+
+    async def _refresh_account(self):
+        try:
+            if self.state.endswith("_PENDING"):
+                raise ValueError("Order outcome pending")
+            if self.record_only:
+                self.account_stats.snapshot = await self.entropy.fetch_account_snapshot()
+                self.account_stats.updated_at = time.monotonic()
+                self.account_stats.error = ""
+            else:
+                await self.account_stats.refresh(self.entropy, self._signed_remaining())
+        except Exception as exc:
+            self.account_stats.error = str(exc)
+            log.warning("Entropy account display refresh: %s", exc)
+
+    async def _account_loop(self):
+        while not self._feed_stop.is_set():
+            await asyncio.sleep(self.cfg.account_refresh_sec)
+            await self._refresh_account()
 
     async def _pulse(self, delay=0.1):
         try:
@@ -311,6 +339,8 @@ class Engine:
     async def _send(self, leg, is_buy, qty, closing, reference_px, reason=""):
         # Checkpoint precedes submission: a crash cannot restart an uncertain order.
         self.state = leg + "_PENDING"
+        self.account_stats.revision += 1
+        submitted_ms = int(time.time() * 1000)
         self._save()
         self._sends.append(time.monotonic())
         limit = self._limit(is_buy, reference_px, leg)
@@ -327,6 +357,7 @@ class Engine:
                 or abs(filled - floor_step(filled, self._step)) > epsilon):
             self._halt(f"{leg} invalid filled quantity: {filled}")
         self.remaining = round(self.remaining - filled if closing else filled, 12)
+        self.account_stats.record_fill(result.get("oid"), filled, submitted_ms)
         self._account_turnover(leg, filled, result.get("avg_px"))
         self.state = leg
         self._save()

@@ -73,6 +73,12 @@ The dashboard, per-fill logs, periodic status logs and shutdown summary show LEG
 
 Counters accumulate across cycles **within the current process** and reset on restart. The cycle checkpoint retains a session snapshot, and `logs/legs.csv` retains fill quantities and prices. Orders recovered via order-status polling try to recover VWAP from their actual trade history. Missing prices produce an explicit incomplete-total indicator with the unpriced filled quantities; limit/protection prices are never substituted.
 
+## Balance and session strategy PnL
+
+The dashboard shows Entropy balance, equity, withdrawable funds, and session net PnL: `realized PnL - actual fees + signed funding + unrealized PnL`. PnL accumulates across cycles and resets on restart. Only this process's LEG2/LEG4 order IDs and the selected symbol contribute; virtual legs and deposits/withdrawals do not. Actual fill fees already include builder fees; configured fee estimates are not used.
+
+Standard accounts show the `io USDC` margin balance. Unified/portfolio-margin accounts show `shared USDC`, excluding other collateral assets; spot holds are not presented as withdrawable margin. Read-only polling defaults to 10 seconds (`logging.account_refresh_sec`). Delayed fills, missing order IDs or unsynchronized positions show unavailable/synchronizing PnL. Failed refreshes retain the previous balance with a stale label. The dashboard remains open through shutdown closing and the final refresh. Record-only mode can show balance with `HL_ACCOUNT_ADDRESS`, but has no strategy PnL. Sources: [account/funding API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals), [unified balances](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot).
+
 ## Tests
 
 ```bash

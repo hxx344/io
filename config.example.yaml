@@ -38,6 +38,7 @@ recorder:
 logging:
   level: INFO
   status_interval_sec: 30.0
+  account_refresh_sec: 10.0    # read-only balance, fills/fees, funding and unrealized PnL
   trades_csv: logs/legs.csv
   dashboard: true
   file: logs/engine.log

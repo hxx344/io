@@ -44,7 +44,8 @@ def test_example():
     "sizing: {quantity: -1}", "sizing: {max_order_notional_usd: 1}",
     "execution: {max_order_attempts: 0}", "execution: {leg_slippage_bps: 10000}",
     "execution: {staleness_sec: 0}", "entropy: {max_orders_per_min: 0}",
-    "logging: {level: unknown}", "logging: {file: ''}", "[]", "cycle: []", "false",
+    "logging: {level: unknown}", "logging: {file: ''}", "logging: {account_refresh_sec: 0}",
+    "logging: {account_refresh_sec: .nan}", "[]", "cycle: []", "false",
 ])
 def test_invalid_config(load, text):
     with pytest.raises(ConfigError):
