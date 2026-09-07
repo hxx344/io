@@ -107,6 +107,8 @@ def test_full_random_long_and_short_cycles(eng):
             await until(lambda: eng.completed_cycles == cycle)
         await task
         assert chosen == ["long", "short"]
+        assert eng.turnover["LEG2"] == 200 and eng.turnover["LEG4"] == 200
+        assert eng.total_turnover == 400
         assert [o["is_buy"] for o in eng.entropy.calls] == [True, False, False, True]
         assert [o["reduce_only"] for o in eng.entropy.calls] == [False, True, False, True]
         assert [r["leg"] for r in eng.recent_trades] == ["LEG1", "LEG2", "LEG3", "LEG4"] * 2
@@ -427,4 +429,84 @@ def test_cleanup_after_recording_error_preserves_exit_slippage_anchor(eng):
         assert eng.entropy.calls[1]["reference_px"] == eng.entropy.calls[2]["reference_px"]
         assert eng.entropy.calls[1]["limit_px"] == eng.entropy.calls[2]["limit_px"]
         assert eng.remaining == 0
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_turnover_sums_actual_partial_entry_and_exit_fills(eng, direction):
+    from decimal import Decimal
+    async def scenario():
+        eng.direction = direction
+        eng.entropy.responses = [
+            dict(status="filled", filled_base=.6, avg_px=100.2),
+            dict(status="filled", filled_base=.2, avg_px=101.1),
+            dict(status="filled", filled_base=.4, avg_px=101.2)]
+        await eng._open_position()
+        await eng._close_position()
+        assert eng.turnover == {"LEG2": Decimal("60.12"), "LEG4": Decimal("60.70")}
+        assert eng.total_turnover == Decimal("120.82")
+        assert not any(eng.unpriced_filled.values())
+        assert [row["filled_notional"] for row in eng.recent_trades] == [
+            Decimal("60.12"), Decimal("20.22"), Decimal("40.48")]
+        import json
+        state = json.loads(eng._journal.path.read_text(encoding="utf-8"))
+        assert Decimal(state["session_turnover"]["LEG4"]) == Decimal("60.70")
+    asyncio.run(scenario())
+
+
+def test_virtual_legs_and_zero_fill_retries_do_not_add_turnover(eng):
+    from decimal import Decimal
+    async def scenario():
+        eng.direction = "long"
+        eng._record("LEG1", "sell", True, 500, 500, 999, 999, "VIRTUAL_FILLED")
+        eng._record("LEG3", "buy", True, 500, 500, 888, 888, "VIRTUAL_FILLED")
+        eng.entropy.responses = [dict(status="canceled", filled_base=0),
+                                 dict(status="filled", filled_base=.5, avg_px=100)]
+        await eng._open_position()
+        assert eng.total_turnover == Decimal("50.0")
+        assert eng.turnover["LEG4"] == 0
+        assert not any(eng.unpriced_filled.values())
+    asyncio.run(scenario())
+
+
+def test_missing_execution_price_does_not_use_limit_as_turnover(eng):
+    async def scenario():
+        eng.direction = "long"
+        eng.entropy.responses = [dict(status="filled", filled_base=1, avg_px=None)]
+        await eng._open_position()
+        assert eng.total_turnover == 0
+        assert eng.unpriced_filled["LEG2"] == 1
+        assert eng.recent_trades[-1]["filled_notional"] is None
+        assert eng.remaining == 1 and not eng.halted
+    asyncio.run(scenario())
+
+
+def test_confirmed_turnover_survives_position_check_failure(eng):
+    async def scenario():
+        eng.direction = "long"
+        original_send = eng.entropy.send_market
+        async def send(**order):
+            result = await original_send(**order)
+            eng.entropy.position_override = .7
+            return result
+        eng.entropy.send_market = send
+        with pytest.raises(RuntimeError, match="position mismatch"):
+            await eng._open_position()
+        assert eng.turnover["LEG2"] == 100 and eng.total_turnover == 100
+    asyncio.run(scenario())
+
+
+def test_csv_failure_does_not_lose_or_duplicate_turnover(eng):
+    async def scenario():
+        eng.direction = "long"
+        original_record = eng._record
+        def failed_record(*args, **kwargs):
+            raise OSError("test disk error")
+        eng._record = failed_record
+        with pytest.raises(OSError):
+            await eng._open_position()
+        assert eng.total_turnover == 100
+        eng._record = original_record
+        await eng._close_position("shutdown")
+        assert eng.turnover["LEG2"] == 100 and eng.turnover["LEG4"] == 100
+        assert eng.total_turnover == 200
     asyncio.run(scenario())

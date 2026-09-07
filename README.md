@@ -67,6 +67,12 @@ Ctrl+C / SIGTERM stops waiting LEG1 without opening a position. With a known pos
 
 `logs/legs.csv` records virtual and real leg events. `logs/minutes.csv` retains the original public-price schema; `hedge_*` means RH reference prices. `tools/analyze.py` provides descriptive statistics only. Virtual legs do not hedge the real Entropy position; cycle PnL depends on its actual fills, fees and funding.
 
+## LEG2 / LEG4 turnover
+
+The dashboard, per-fill logs, periodic status logs and shutdown summary show LEG2 turnover, LEG4 turnover, and their sum. Each real fill contributes `actual filled quantity * actual average execution price`. Both entry and exit count positively; partial fills and closing retries contribute only their actual fills. Virtual legs and unfilled orders contribute nothing. This is gross trading turnover before fees/funding, not PnL: a $50 entry plus a $51 exit totals $101.
+
+Counters accumulate across cycles **within the current process** and reset on restart. The cycle checkpoint retains a session snapshot, and `logs/legs.csv` retains fill quantities and prices. Orders recovered via order-status polling try to recover VWAP from their actual trade history. Missing prices produce an explicit incomplete-total indicator with the unpriced filled quantities; limit/protection prices are never substituted.
+
 ## Tests
 
 ```bash

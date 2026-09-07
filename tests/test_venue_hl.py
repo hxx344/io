@@ -142,3 +142,35 @@ def test_market_invalid_slippage_never_submits(reference, slip):
             await v.send_market(is_buy=True, qty=1, reference_px=reference, slippage_bps=slip)
         assert v._post_exchange.await_count == 0
     asyncio.run(scenario())
+
+
+def test_order_status_recovery_uses_actual_fills_for_vwap():
+    async def scenario():
+        v = venue()
+        v._post_exchange = AsyncMock(return_value=(None, None, True))
+        v._info = AsyncMock(side_effect=[
+            {"status": "order", "order": {"status": "canceled", "order": {
+                "oid": 12, "origSz": "1", "sz": ".5"}}},
+            [{"oid": 12, "coin": "io:TEST", "tid": 1, "sz": ".2", "px": "100"},
+             {"oid": 12, "coin": "io:TEST", "tid": 2, "sz": ".3", "px": "102"},
+             {"oid": 12, "coin": "io:TEST", "tid": 2, "sz": ".3", "px": "102"},
+             {"oid": 13, "coin": "io:TEST", "tid": 3, "sz": "1", "px": "999"},
+             {"oid": 12, "coin": "io:OTHER", "tid": 4, "sz": "1", "px": "999"}]])
+        result = await v.send_market(is_buy=True, qty=1, reference_px=100, slippage_bps=20)
+        assert result["filled_base"] == .5
+        assert result["avg_px"] == pytest.approx(101.2)
+        assert not result["unresolved"]
+        assert v._info.call_args.args[0]["type"] == "userFills"
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fills", [[], {},
+    [{"oid": 12, "coin": "io:TEST", "tid": 1, "sz": ".1", "px": "100"}],
+    [{"oid": 12, "coin": "io:TEST", "tid": 1, "sz": ".5", "px": "NaN"}],
+    TimeoutError("price lookup timeout")])
+def test_incomplete_fill_history_never_extrapolates_a_price(fills):
+    async def scenario():
+        v = venue()
+        v._info = AsyncMock(side_effect=[fills])
+        assert await v._fill_average(12, .5) is None
+    asyncio.run(scenario())

@@ -29,3 +29,16 @@ def test_four_leg_display(eng):
 def test_record_only(eng):
     eng.markets_ready, eng.record_only = True, True
     assert "RECORD-ONLY" in render(eng)
+
+
+def test_dashboard_displays_real_turnover_and_missing_price(eng):
+    eng.markets_ready = True
+    eng._account_turnover("LEG2", .5, 100)
+    eng._account_turnover("LEG4", .5, 102)
+    text = render(eng, "zh")
+    for word in ("本次成交额", "LEG2 $50.00", "LEG4 $51.00", "合计 $101.00"):
+        assert word in text
+    assert "Total $101.00" in render(eng)
+    eng._account_turnover("LEG4", .1, None)
+    assert "合计不完整" in render(eng, "zh")
+    assert "Incomplete" in render(eng)

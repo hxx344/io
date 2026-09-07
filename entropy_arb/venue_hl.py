@@ -256,11 +256,47 @@ class HLVenue:
                 terminal = (status in ("filled", "canceled", "rejected")
                             or status.endswith("Canceled") or status.endswith("Rejected"))
                 if terminal and math.isfinite(filled) and 0 <= filled <= qty:
+                    avg = await self._fill_average(inner.get("oid"), filled) if filled > 0 else None
                     return {"status": status, "filled_base": filled,
-                            "avg_px": None, "err": None, "unresolved": False}
+                            "avg_px": avg, "err": None, "unresolved": False}
             await asyncio.sleep(0.5)
         return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
                 "err": f"cloid={cloid.to_raw()}", "unresolved": True}
+
+    async def _fill_average(self, oid, expected_qty: float) -> Optional[float]:
+        """Recover execution VWAP after orderStatus confirms quantity but no price.
+
+        A partial/missing history is never extrapolated into a reported turnover.
+        Settlement remains confirmed even if this read-only accounting lookup fails.
+        """
+        if oid is None:
+            return None
+        try:
+            fills = await self._info({"type": "userFills", "user": self.account.query_address,
+                                      "aggregateByTime": False})
+            if not isinstance(fills, list):
+                return None
+            sizes, quotes, seen = [], [], set()
+            for fill in fills:
+                if fill.get("coin") != self.coin or str(fill.get("oid")) != str(oid):
+                    continue
+                tid = fill.get("tid")
+                if tid is not None:
+                    if tid in seen:
+                        continue
+                    seen.add(tid)
+                size, price = float(fill["sz"]), float(fill["px"])
+                if not (math.isfinite(size) and size > 0 and math.isfinite(price) and price > 0):
+                    return None
+                sizes.append(size)
+                quotes.append(size * price)
+            total_size = math.fsum(sizes)
+            tolerance = 10 ** -self.size_decimals * 1e-6
+            if total_size > 0 and abs(total_size - expected_qty) <= tolerance:
+                return math.fsum(quotes) / total_size
+        except Exception as exc:
+            log.warning("[%s] execution price lookup failed for oid=%s: %s", self.name, oid, exc)
+        return None
 
     async def _post_exchange(self, payload: dict):
         try:

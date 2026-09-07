@@ -8,6 +8,7 @@ import math
 import random
 import time
 from collections import deque
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import aiohttp
@@ -49,6 +50,8 @@ class Engine:
         self._last_reconcile = 0.0
         self._exposure_since = 0.0
         self._market_references = {}
+        self.turnover = {"LEG2": Decimal(0), "LEG4": Decimal(0)}
+        self.unpriced_filled = {"LEG2": Decimal(0), "LEG4": Decimal(0)}
         self.recorder = None
 
     def request_stop(self):
@@ -59,7 +62,41 @@ class Engine:
         self._journal.save({"state": self.state, "cycle": self.cycle,
                             "symbol": self.cfg.symbol, "direction": self.direction,
                             "remaining": self.remaining, "reason": self.halt_reason,
+                            "session_turnover": {leg: str(value) for leg, value in self.turnover.items()},
+                            "session_unpriced_filled": {leg: str(value) for leg, value in self.unpriced_filled.items()},
                             "updated_at": time.time()})
+
+    @property
+    def total_turnover(self):
+        return sum(self.turnover.values(), Decimal(0))
+
+    @staticmethod
+    def _fill_notional(filled, avg):
+        if filled == 0:
+            return Decimal(0)
+        try:
+            qty, price = Decimal(str(filled)), Decimal(str(avg))
+        except InvalidOperation:
+            return None
+        if not (qty.is_finite() and qty > 0 and price.is_finite() and price > 0):
+            return None
+        return qty * price
+
+    def _account_turnover(self, leg, filled, avg):
+        # Called once per settled real order, independently of CSV/position checks.
+        notional = self._fill_notional(filled, avg)
+        if notional is None:
+            self.unpriced_filled[leg] += Decimal(str(filled))
+            log.warning("%s confirmed fill qty=%g has no execution price; turnover incomplete", leg, filled)
+        else:
+            self.turnover[leg] += notional
+        self._log_turnover()
+
+    def _log_turnover(self):
+        log.info("session turnover LEG2=$%s LEG4=$%s total=$%s "
+                 "unpriced_base LEG2=%s LEG4=%s",
+                 f"{self.turnover['LEG2']:,.2f}", f"{self.turnover['LEG4']:,.2f}",
+                 f"{self.total_turnover:,.2f}", self.unpriced_filled["LEG2"], self.unpriced_filled["LEG4"])
 
     def _halt(self, reason):
         self.halted, self.halt_reason, self.state = True, reason, "HALTED"
@@ -114,6 +151,7 @@ class Engine:
                 await venue.close()
             await self.session.close()
             self._journal.close()
+            self._log_turnover()
 
     async def _pulse(self, delay=0.1):
         try:
@@ -157,7 +195,8 @@ class Engine:
         row = dict(zip(CSV_HEADER, [time.time(), self.cycle, self.direction, leg,
                        "lighter-rh" if virtual else "entropy", side, virtual,
                        qty, filled, limit, avg, status, reason]))
-        self.recent_trades.append(row)
+        self.recent_trades.append({**row, "filled_notional":
+                                  None if virtual else self._fill_notional(filled, avg)})
         path = Path(self.cfg.trades_csv)
         path.parent.mkdir(parents=True, exist_ok=True)
         header = not path.exists() or path.stat().st_size == 0
@@ -288,6 +327,7 @@ class Engine:
                 or abs(filled - floor_step(filled, self._step)) > epsilon):
             self._halt(f"{leg} invalid filled quantity: {filled}")
         self.remaining = round(self.remaining - filled if closing else filled, 12)
+        self._account_turnover(leg, filled, result.get("avg_px"))
         self.state = leg
         self._save()
         await self._confirm_position(self._signed_remaining())
@@ -396,4 +436,5 @@ class Engine:
         while not self._feed_stop.is_set():
             log.info("4LEG state=%s cycle=%d completed=%d direction=%s Entropy remaining=%g",
                      self.state, self.cycle, self.completed_cycles, self.direction, self.remaining)
+            self._log_turnover()
             await asyncio.sleep(self.cfg.status_interval_sec)

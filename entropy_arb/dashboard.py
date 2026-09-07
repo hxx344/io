@@ -55,14 +55,23 @@ class Dashboard:
                    + f"@ {order['price']:g}" if order
                    else self._t("No virtual order", "暂无虚拟挂单"))
         status = Text(virtual + " | " + self._t("Entropy remaining", "Entropy 待平数量") + f" {e.remaining:g}")
+        turnover = Text(self._t("Session turnover", "本次成交额")
+                        + f" | LEG2 ${e.turnover['LEG2']:,.2f} | LEG4 ${e.turnover['LEG4']:,.2f} | "
+                        + self._t("Total", "合计") + f" ${e.total_turnover:,.2f}")
+        if any(e.unpriced_filled.values()):
+            turnover.append("\n" + self._t("Incomplete: unpriced filled quantity", "合计不完整：缺少均价的已成交数量")
+                            + f" LEG2={e.unpriced_filled['LEG2']} LEG4={e.unpriced_filled['LEG4']}",
+                            style="yellow")
         legs = Table(expand=True)
-        for name in ("Cycle", "Leg", "Venue", "Side", "Filled", "Status"):
+        for name in ("Cycle", "Leg", "Venue", "Side", "Filled", self._t("Notional", "成交额"), "Status"):
             legs.add_column(name)
         for row in list(e.recent_trades)[-8:]:
             legs.add_row(str(row["cycle"]), row["leg"], row["venue"], row["side"],
-                         f"{row['filled_qty']:g}", row["status"])
+                         f"{row['filled_qty']:g}",
+                         f"${row['filled_notional']:,.2f}" if row.get("filled_notional") is not None else "—",
+                         row["status"])
         events = Text("\n".join(list(self.log_buffer.lines)[-6:]) if self.log_buffer else "")
-        return Panel(Group(state, books, status, legs, events), title=title)
+        return Panel(Group(state, books, status, turnover, legs, events), title=title)
 
     async def run(self):
         with Live(self._safe_render(), console=self.console, refresh_per_second=4) as live:
