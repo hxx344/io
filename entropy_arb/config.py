@@ -1,76 +1,32 @@
-"""Configuration: strategy from a YAML file, credentials from .env, market
-selection (symbol + hedge venue) from the command line.
-
-The split is deliberate: config.yaml IS the strategy (thresholds, sizing,
-risk) and is safe to share/commit as an example; .env holds only secrets;
-which markets to trade is stated explicitly on every start (--symbol,
---hedge). Every YAML key is validated against the schema below, so a typo
-is an error rather than a setting that silently does nothing.
-
-Threshold model (fixed numbers the user derives from recorded minute data):
-
-    premium_bps = (entropy_price / hedge_price - 1) * 10_000
-
-    SELL entropy / BUY hedge  fires when the executable premium
-        (entropy bid over hedge ask) >= midline_bps + upper_bps
-    BUY entropy / SELL hedge  fires when the executable premium
-        (entropy ask under hedge bid) <= midline_bps - lower_bps
-
-    Both hurdles are net of both venues' taker fees, so a full round trip
-    nets >= (upper_bps + lower_bps) after fees by construction.
-"""
+"""Fixed RH virtual-maker / Entropy taker cycle configuration."""
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
 import yaml
 from dotenv import load_dotenv
 
 HL_API_URL = "https://api.hyperliquid.xyz"
-HL_WS_URL = "wss://api.hyperliquid.xyz/ws"   # official ws — the only HL feed used
-
-HEDGE_VENUES = ("lighter", "lighter-rh", "tradexyz")
+HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
+HEDGE_VENUES = ("lighter-rh",)
 
 
 @dataclass(frozen=True)
 class LighterProfile:
-    name: str
-    api_url: str
-    ws_url: str
-    chain_id: int
+    name: str = "robinhood"
+    api_url: str = "https://api.rh.lighter.xyz"
+    ws_url: str = "wss://api.rh.lighter.xyz/stream"
+    chain_id: int = 466324
 
 
-# Endpoint profiles for the two supported zkLighter deployments (these match
-# lighter-python's lighter.endpoint_profiles, duplicated here so --record-only
-# data collection works without the SDK installed).
-LIGHTER_PROFILES: Dict[str, LighterProfile] = {
-    "lighter": LighterProfile(
-        "mainnet", "https://mainnet.zklighter.elliot.ai",
-        "wss://mainnet.zklighter.elliot.ai/stream", 304),
-    "lighter-rh": LighterProfile(
-        "robinhood", "https://api.rh.lighter.xyz",
-        "wss://api.rh.lighter.xyz/stream", 466324),
-}
-
-
-@dataclass
-class LighterCreds:
-    account_index: Optional[int]
-    api_key_index: Optional[int]
-    api_private_key: Optional[str]
-
-    @property
-    def complete(self) -> bool:
-        return (self.account_index is not None and self.api_key_index is not None
-                and bool(self.api_private_key))
+LIGHTER_PROFILES = {"lighter-rh": LighterProfile()}
 
 
 @dataclass
 class HLCreds:
-    private_key: Optional[str]
-    account_address: Optional[str]
+    private_key: str | None
+    account_address: str | None
 
     @property
     def complete(self) -> bool:
@@ -79,291 +35,143 @@ class HLCreds:
 
 @dataclass
 class VenueConf:
-    key: str                  # "entropy" | "hedge"
-    kind: str                 # "hl" | "lighter"
-    label: str                # human name for logs, e.g. "ENTROPY", "RH"
+    key: str
+    kind: str
+    label: str
     symbol: str
-    fee_bps: float
-    cap_usd: float
-    orders_per_min: int
-    # hl
-    hl_dex: str = ""
-    hl_creds: Optional[HLCreds] = None
-    # lighter
-    lighter_profile: Optional[LighterProfile] = None
-    lighter_creds: Optional[LighterCreds] = None
+    fee_bps: float = 0.0
+    cap_usd: float = 1000.0
+    orders_per_min: int = 120
+    hl_dex: str = "io"
+    hl_creds: HLCreds | None = None
+    lighter_profile: LighterProfile | None = None
 
 
 @dataclass
 class Config:
     symbol: str
-    hedge_venue: str
     entropy: VenueConf
     hedge: VenueConf
-    # thresholds (the whole signal)
-    midline_bps: float
-    upper_bps: float
-    lower_bps: float
-    # sizing
-    take_fraction: float
-    max_order_notional: float
-    min_order_notional: float
-    # inventory ladder
-    inventory_scale_bps: float
-    inventory_floor_frac: float
-    # execution
-    premium_persist_sec: float
-    cooldown_sec: float
-    settle_timeout_sec: float
-    leg_slippage_bps: float
-    hedge_slippage_bps: float
-    net_tolerance_base: float
-    max_consecutive_errors: int
-    rate_limit_pause_sec: float
-    staleness_sec: float
-    reconcile_sec: float
-    venue_probe_sec: float
-    http_keepalive_sec: float
-    # recorder
-    recorder_enabled: bool
-    recorder_csv: str
-    # logging
-    log_level: str
-    status_interval_sec: float
-    trades_csv: str
-    dashboard: bool
-    log_file: str
-    # runtime
+    hedge_venue: str = "lighter-rh"
+    direction: str = "random"
+    cycles: int = 0
+    virtual_offset_bps: float = 2.0
+    virtual_requote_sec: float = 3.0
+    quantity: float = 0.0  # 0 sizes from order_notional
+    order_notional: float = 50.0
+    max_order_notional: float = 500.0
+    min_order_notional: float = 10.0
+    cooldown_sec: float = 2.0
+    settle_timeout_sec: float = 5.0
+    leg_slippage_bps: float = 20.0
+    max_order_attempts: int = 3
+    retry_delay_sec: float = 1.0
+    rate_limit_pause_sec: float = 10.0
+    staleness_sec: float = 10.0
+    reconcile_sec: float = 15.0
+    http_keepalive_sec: float = 10.0
+    max_hold_sec: float = 0.0
+    recorder_enabled: bool = True
+    recorder_csv: str = "logs/minutes.csv"
+    log_level: str = "INFO"
+    status_interval_sec: float = 30.0
+    trades_csv: str = "logs/legs.csv"
+    state_file: str = "logs/cycle.json"
+    dashboard: bool = True
+    log_file: str = "logs/engine.log"
     hl_api_url: str = HL_API_URL
     hl_ws_url: str = HL_WS_URL
 
     @property
     def creds_complete(self) -> bool:
-        for v in (self.entropy, self.hedge):
-            if v.kind == "hl" and not (v.hl_creds and v.hl_creds.complete):
-                return False
-            if v.kind == "lighter" and not (v.lighter_creds
-                                            and v.lighter_creds.complete):
-                return False
-        return True
-
-
-# ----------------------------------------------------------------- YAML layer
-
-# Schema: nested dict of key -> type (or nested dict). Unknown keys are errors.
-_SCHEMA: Dict[str, Any] = {
-    "thresholds": {
-        "midline_bps": float,
-        "upper_bps": float,
-        "lower_bps": float,
-    },
-    "entropy": {
-        "dex": str,
-        "taker_fee_bps": float,
-        "max_position_usd": float,
-        "max_orders_per_min": int,
-    },
-    "hedge": {
-        "taker_fee_bps": float,
-        "max_position_usd": float,
-        "max_orders_per_min": int,
-    },
-    "sizing": {
-        "take_fraction": float,
-        "max_order_notional_usd": float,
-        "min_order_notional_usd": float,
-    },
-    "inventory": {
-        "scale_bps": float,
-        "floor_frac": float,
-    },
-    "execution": {
-        "premium_persist_sec": float,
-        "cooldown_sec": float,
-        "settle_timeout_sec": float,
-        "leg_slippage_bps": float,
-        "hedge_slippage_bps": float,
-        "net_tolerance_base": float,
-        "max_consecutive_errors": int,
-        "rate_limit_pause_sec": float,
-        "staleness_sec": float,
-        "reconcile_sec": float,
-        "venue_probe_sec": float,
-        "http_keepalive_sec": float,
-    },
-    "recorder": {
-        "enabled": bool,
-        "csv": str,
-    },
-    "logging": {
-        "level": str,
-        "status_interval_sec": float,
-        "trades_csv": str,
-        "dashboard": bool,
-        "file": str,
-    },
-}
+        return bool(self.entropy.hl_creds and self.entropy.hl_creds.complete)
 
 
 class ConfigError(ValueError):
     pass
 
 
-def _validate(node: Any, schema: Dict[str, Any], path: str = "") -> None:
-    if not isinstance(node, dict):
-        raise ConfigError(f"'{path or '<root>'}' must be a mapping")
-    for key, val in node.items():
-        here = f"{path}.{key}" if path else str(key)
-        if key not in schema:
-            raise ConfigError(f"unknown config key '{here}' "
-                              f"(valid: {', '.join(sorted(schema))})")
-        want = schema[key]
-        if isinstance(want, dict):
-            _validate(val, want, here)
-        elif want is float:
-            if not isinstance(val, (int, float)) or isinstance(val, bool):
-                raise ConfigError(f"'{here}' must be a number, got {val!r}")
-        elif want is int:
-            if not isinstance(val, int) or isinstance(val, bool):
-                raise ConfigError(f"'{here}' must be an integer, got {val!r}")
-        elif want is bool:
-            if not isinstance(val, bool):
-                raise ConfigError(f"'{here}' must be true/false, got {val!r}")
-        elif want is str:
-            if not isinstance(val, str):
-                raise ConfigError(f"'{here}' must be a string, got {val!r}")
+_SCHEMA = {
+    "cycle": {"direction": ("direction", str), "cycles": ("cycles", int),
+              "virtual_offset_bps": ("virtual_offset_bps", float),
+              "virtual_requote_sec": ("virtual_requote_sec", float),
+              "max_hold_sec": ("max_hold_sec", float), "state_file": ("state_file", str)},
+    "sizing": {"quantity": ("quantity", float), "order_notional_usd": ("order_notional", float),
+               "max_order_notional_usd": ("max_order_notional", float),
+               "min_order_notional_usd": ("min_order_notional", float)},
+    "execution": {k: (k, t) for k, t in {
+        "cooldown_sec": float, "settle_timeout_sec": float, "leg_slippage_bps": float,
+        "max_order_attempts": int, "retry_delay_sec": float, "rate_limit_pause_sec": float,
+        "staleness_sec": float, "reconcile_sec": float, "http_keepalive_sec": float}.items()},
+    "recorder": {"enabled": ("recorder_enabled", bool), "csv": ("recorder_csv", str)},
+    "logging": {"level": ("log_level", str), "status_interval_sec": ("status_interval_sec", float),
+                "trades_csv": ("trades_csv", str), "dashboard": ("dashboard", bool),
+                "file": ("log_file", str)},
+    "entropy": {"dex": ("hl_dex", str), "taker_fee_bps": ("fee_bps", float),
+                "max_position_usd": ("cap_usd", float), "max_orders_per_min": ("orders_per_min", int)},
+}
 
 
-def _get(d: dict, section: str, key: str, default):
-    return (d.get(section) or {}).get(key, default)
-
-
-# ------------------------------------------------------------------ env layer
-
-def _env_s(name: str) -> Optional[str]:
-    v = os.getenv(name)
-    return v.strip() if v not in (None, "") else None
-
-
-def _env_i(name: str) -> Optional[int]:
-    v = os.getenv(name)
-    return int(v) if v not in (None, "") else None
-
-
-# -------------------------------------------------------------------- loading
-
-def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
-                symbol: str, hedge_venue: str) -> Config:
+def load_config(config_file="config.yaml", env_file=".env", *,
+                symbol: str, hedge_venue="lighter-rh") -> Config:
     load_dotenv(env_file)
     try:
-        with open(config_file) as fh:
-            raw = yaml.safe_load(fh) or {}
-    except FileNotFoundError:
-        raise ConfigError(
-            f"config file '{config_file}' not found — copy config.example.yaml "
-            f"to config.yaml and edit it / 未找到配置文件，请先复制 "
-            f"config.example.yaml 为 config.yaml 并修改")
-    _validate(raw, _SCHEMA)
-
+        with open(config_file, encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f"Cannot read {config_file}: {exc}") from exc
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("config must be a mapping")
+    if hedge_venue != "lighter-rh":
+        raise ConfigError("--hedge is fixed to lighter-rh")
     symbol = (symbol or "").strip()
     if not symbol:
-        raise ConfigError("--symbol is required, e.g. --symbol SNDK / "
-                          "必须用 --symbol 指定交易品种")
-    if hedge_venue not in HEDGE_VENUES:
-        raise ConfigError(
-            f"--hedge must be one of {list(HEDGE_VENUES)}, got "
-            f"{hedge_venue!r} / --hedge 必须是 {list(HEDGE_VENUES)} 之一")
-
-    thr = raw.get("thresholds") or {}
-    for k in ("midline_bps", "upper_bps", "lower_bps"):
-        if k not in thr:
-            raise ConfigError(f"'thresholds.{k}' is required — derive it from "
-                              f"recorded minute data / 必须填写，请用采集的分钟"
-                              f"数据计算后填入")
-    upper, lower = float(thr["upper_bps"]), float(thr["lower_bps"])
-    if upper <= 0 or lower <= 0:
-        raise ConfigError("thresholds.upper_bps and lower_bps must be > 0 "
-                          "(the round trip nets upper+lower bps after fees)")
-
-    take_fraction = float(_get(raw, "sizing", "take_fraction", 0.5))
-    if not 0.0 < take_fraction <= 1.0:
-        raise ConfigError("sizing.take_fraction must be in (0, 1] — taking "
-                          "more than the profitable depth loses money on the "
-                          "tail / 必须在 (0, 1] 之间")
-
-    entropy_dex = _get(raw, "entropy", "dex", "io")
-    if hedge_venue == "tradexyz" and entropy_dex == "xyz":
-        raise ConfigError("entropy.dex 'xyz' with hedge_venue 'tradexyz' is "
-                          "the same market on both legs / 两条腿是同一个市场")
-
-    entropy_hl_creds = HLCreds(_env_s("HL_PRIVATE_KEY"),
-                               _env_s("HL_ACCOUNT_ADDRESS"))
-    entropy = VenueConf(
-        key="entropy", kind="hl", label="ENTROPY",
-        symbol=symbol,
-        fee_bps=float(_get(raw, "entropy", "taker_fee_bps", 0.0)),
-        cap_usd=float(_get(raw, "entropy", "max_position_usd", 1000.0)),
-        orders_per_min=int(_get(raw, "entropy", "max_orders_per_min", 120)),
-        hl_dex=entropy_dex,
-        hl_creds=entropy_hl_creds,
-    )
-
-    if hedge_venue == "tradexyz":
-        hedge = VenueConf(
-            key="hedge", kind="hl", label="XYZ",
-            symbol=symbol,
-            fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 1.0)),
-            cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
-            orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
-            hl_dex="xyz",
-            hl_creds=HLCreds(
-                _env_s("HL_PRIVATE_KEY_XYZ") or _env_s("HL_PRIVATE_KEY"),
-                _env_s("HL_ACCOUNT_ADDRESS_XYZ") or _env_s("HL_ACCOUNT_ADDRESS")),
-        )
-    else:
-        hedge = VenueConf(
-            key="hedge", kind="lighter",
-            label="LIGHTER" if hedge_venue == "lighter" else "RH",
-            symbol=symbol,
-            fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 0.0)),
-            cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
-            orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),
-            lighter_profile=LIGHTER_PROFILES[hedge_venue],
-            lighter_creds=LighterCreds(_env_i("LIGHTER_ACCOUNT_INDEX"),
-                                       _env_i("LIGHTER_API_KEY_INDEX"),
-                                       _env_s("LIGHTER_API_PRIVATE_KEY")),
-        )
-
-    return Config(
-        symbol=symbol,
-        hedge_venue=hedge_venue,
-        entropy=entropy,
-        hedge=hedge,
-        midline_bps=float(thr["midline_bps"]),
-        upper_bps=upper,
-        lower_bps=lower,
-        take_fraction=take_fraction,
-        max_order_notional=float(_get(raw, "sizing", "max_order_notional_usd", 500.0)),
-        min_order_notional=float(_get(raw, "sizing", "min_order_notional_usd", 10.0)),
-        inventory_scale_bps=float(_get(raw, "inventory", "scale_bps", 10.0)),
-        inventory_floor_frac=float(_get(raw, "inventory", "floor_frac", 0.5)),
-        premium_persist_sec=float(_get(raw, "execution", "premium_persist_sec", 0.3)),
-        cooldown_sec=float(_get(raw, "execution", "cooldown_sec", 0.0)),
-        settle_timeout_sec=float(_get(raw, "execution", "settle_timeout_sec", 5.0)),
-        leg_slippage_bps=float(_get(raw, "execution", "leg_slippage_bps", 50.0)),
-        hedge_slippage_bps=float(_get(raw, "execution", "hedge_slippage_bps", 20.0)),
-        net_tolerance_base=float(_get(raw, "execution", "net_tolerance_base", 0.001)),
-        max_consecutive_errors=int(_get(raw, "execution", "max_consecutive_errors", 3)),
-        rate_limit_pause_sec=float(_get(raw, "execution", "rate_limit_pause_sec", 10.0)),
-        staleness_sec=float(_get(raw, "execution", "staleness_sec", 10.0)),
-        reconcile_sec=float(_get(raw, "execution", "reconcile_sec", 15.0)),
-        venue_probe_sec=float(_get(raw, "execution", "venue_probe_sec", 30.0)),
-        http_keepalive_sec=float(_get(raw, "execution", "http_keepalive_sec", 10.0)),
-        recorder_enabled=bool(_get(raw, "recorder", "enabled", True)),
-        recorder_csv=_get(raw, "recorder", "csv", "logs/minutes.csv"),
-        log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
-        status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
-        trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
-        dashboard=bool(_get(raw, "logging", "dashboard", True)),
-        log_file=_get(raw, "logging", "file", "logs/engine.log"),
-    )
+        raise ConfigError("--symbol is required")
+    values, entropy_values = {}, {}
+    for section, node in raw.items():
+        if section not in _SCHEMA:
+            raise ConfigError(f"unknown config key '{section}'")
+        if not isinstance(node, dict):
+            raise ConfigError(f"'{section}' must be a mapping")
+        for key, value in node.items():
+            if key not in _SCHEMA[section]:
+                raise ConfigError(f"unknown config key '{section}.{key}'")
+            field, kind = _SCHEMA[section][key]
+            valid = (type(value) in (int, float) and math.isfinite(value)) if kind is float else type(value) is kind
+            if not valid:
+                raise ConfigError(f"'{section}.{key}' must be a finite {kind.__name__}")
+            (entropy_values if section == "entropy" else values)[field] = kind(value)
+    if entropy_values.get("hl_dex", "io") != "io":
+        raise ConfigError("entropy.dex is fixed to io")
+    creds = HLCreds(os.getenv("HL_PRIVATE_KEY", "").strip() or None,
+                    os.getenv("HL_ACCOUNT_ADDRESS", "").strip() or None)
+    cfg = Config(symbol=symbol,
+                 entropy=VenueConf("entropy", "hl", "ENTROPY", symbol, hl_creds=creds, **entropy_values),
+                 hedge=VenueConf("hedge", "lighter", "RH (virtual)", symbol,
+                                 lighter_profile=LIGHTER_PROFILES["lighter-rh"]), **values)
+    if cfg.direction not in ("long", "short", "random"):
+        raise ConfigError("cycle.direction must be long, short or random")
+    for key in ("cycles", "quantity", "cooldown_sec", "max_hold_sec"):
+        if getattr(cfg, key) < 0:
+            raise ConfigError(f"{key} must be >= 0")
+    for key in ("virtual_offset_bps", "virtual_requote_sec", "order_notional", "max_order_notional",
+                "min_order_notional", "settle_timeout_sec", "max_order_attempts", "retry_delay_sec",
+                "rate_limit_pause_sec", "staleness_sec", "reconcile_sec", "http_keepalive_sec",
+                "status_interval_sec"):
+        if getattr(cfg, key) <= 0:
+            raise ConfigError(f"{key} must be > 0")
+    if not 0 <= cfg.leg_slippage_bps < 10000 or cfg.virtual_offset_bps >= 10000:
+        raise ConfigError("slippage must be in [0, 10000), virtual offset in (0, 10000)")
+    if not cfg.min_order_notional <= cfg.order_notional <= cfg.max_order_notional:
+        raise ConfigError("min_order_notional <= order_notional <= max_order_notional required")
+    if cfg.entropy.cap_usd <= 0 or cfg.entropy.orders_per_min <= 0 or cfg.entropy.fee_bps < 0:
+        raise ConfigError("entropy cap/orders must be positive and fees nonnegative")
+    for key in ("state_file", "trades_csv", "recorder_csv", "log_file"):
+        if not getattr(cfg, key).strip():
+            raise ConfigError(f"{key} must not be empty")
+    cfg.log_level = cfg.log_level.upper()
+    if cfg.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        raise ConfigError("invalid logging.level")
+    return cfg

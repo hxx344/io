@@ -1,3 +1,3 @@
-"""entropy-arb: two-venue perp arbitrage — Entropy vs one hedge venue."""
+"""Fixed four-leg scalping: Lighter RH virtual makers and Entropy real takers."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

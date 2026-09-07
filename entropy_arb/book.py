@@ -22,18 +22,23 @@ class OrderBook:
         self.ready = False
         self.last_update_ts = 0.0
         self.alive_ts = 0.0
+        self.revision = 0
+        self.generation = 0
 
     def touch(self) -> None:
         self.alive_ts = time.time()
 
     def clear(self) -> None:
+        self.generation += 1
         self.bids.clear()
         self.asks.clear()
         self.ready = False
 
     # ---- zkLighter snapshot + diff ----
     def apply_lighter(self, ob: dict, snapshot: bool) -> None:
+        self.revision += 1
         if snapshot:
+            self.generation += 1
             self.bids.clear()
             self.asks.clear()
         for name, side in (("bids", self.bids), ("asks", self.asks)):
@@ -49,6 +54,7 @@ class OrderBook:
 
     # ---- Hyperliquid full snapshot ----
     def apply_hl(self, levels: list) -> None:
+        self.revision += 1
         self.bids = {float(l["px"]): float(l["sz"])
                      for l in levels[0] if float(l["sz"]) > 0}
         self.asks = {float(l["px"]): float(l["sz"])

@@ -1,26 +1,9 @@
-"""Automatic 1-minute orderbook data recorder.
+"""One-minute public order-book recorder.
 
-While the bot runs (live or --record-only), both venues' actual order books
-are sampled once per second and aggregated into one CSV row per minute.
-This is the dataset users analyze (tools/analyze.py) to choose
-thresholds.midline_bps / upper_bps / lower_bps for config.yaml.
-
-Definitions (all in bps, fees NOT included — the engine adds fees on top):
-
-    premium    = (entropy_mid / hedge_mid - 1) * 1e4
-                 the mid-to-mid premium of Entropy over the hedge venue;
-                 its long-run center is what midline_bps hardcodes.
-    sell_edge  = (entropy_bid / hedge_ask - 1) * 1e4
-                 the EXECUTABLE premium for SELL-entropy/BUY-hedge; the
-                 engine fires this direction when sell_edge clears
-                 midline_bps + upper_bps (plus fees).
-    buy_edge   = (hedge_bid / entropy_ask - 1) * 1e4
-                 the executable premium for BUY-entropy/SELL-hedge; fires
-                 when buy_edge clears lower_bps - midline_bps (plus fees).
-
-Bid/ask columns are the minute's last fresh sample (close). A row is only
-written for minutes with at least one sample where both books were fresh;
-`samples` says how many of the ~60 seconds qualified.
+Both books are sampled once per second. The existing CSV schema is retained:
+hedge_* columns now refer to Lighter RH public reference prices. Premium and
+sell/buy edge columns are descriptive cross-venue statistics, not four-leg
+entry signals or estimates of scalping PnL. Only fresh books are sampled.
 """
 from __future__ import annotations
 

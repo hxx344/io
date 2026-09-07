@@ -74,6 +74,8 @@ class LighterBookFeed:
         if not self._synced:
             return  # no snapshot yet (fresh connection, or one pending after a gap)
         prev, begin, end = self._nonce, ob.get("begin_nonce"), ob.get("nonce")
+        if prev is not None and end is not None and end <= prev:
+            return  # duplicate or out-of-order delta
         if prev is not None and begin is not None and begin > prev + 1:
             log.warning("[%s] diff gap (had %s, got %s) — resubscribing",
                         self.name, prev, begin)

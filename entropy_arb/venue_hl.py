@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from typing import Optional
 
 import aiohttp
@@ -86,7 +87,6 @@ class HLVenue:
         self.size_decimals = 0
         self.min_base = 0.0
         self.min_quote = 10.0
-        self._cloid = int(time.time() * 1000)
         self._signing = None      # lazy hyperliquid-sdk signing module
 
     async def _info(self, payload: dict):
@@ -176,14 +176,15 @@ class HLVenue:
 
     def _next_cloid(self):
         from hyperliquid.utils.types import Cloid
-        self._cloid += 1
-        return Cloid.from_int(self._cloid)
+        return Cloid.from_int(uuid.uuid4().int)
 
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
                          reduce_only: bool = False) -> dict:
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
         cloid = self._next_cloid()
+        log.info("[%s] submit cloid=%s side=%s qty=%g reduce_only=%s",
+                 self.name, cloid.to_raw(), "buy" if is_buy else "sell", qty, reduce_only)
         order_req = {"coin": self.coin, "is_buy": is_buy, "sz": round(qty, 8),
                      "limit_px": limit_px,
                      "order_type": {"limit": {"tif": "Ioc"}},
@@ -209,29 +210,30 @@ class HLVenue:
             if not res.get("unresolved"):
                 return res
         # unknown outcome: poll orderStatus by cloid until the deadline
-        deadline = time.time() + self.settle_timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + self.settle_timeout
+        while time.monotonic() < deadline:
             try:
                 st = await self._info({"type": "orderStatus",
                                        "user": self.account.query_address,
                                        "oid": cloid.to_raw()})
             except Exception:
                 st = None
-            if st and st.get("status") == "order":
+            if isinstance(st, dict) and st.get("status") == "order":
                 o = st.get("order") or {}
                 status = str(o.get("status", ""))
                 inner = o.get("order") or {}
                 try:
-                    filled = max(float(inner.get("origSz") or 0)
-                                 - float(inner.get("sz") or 0), 0.0)
-                except (TypeError, ValueError):
-                    filled = 0.0
-                if status != "open":
+                    filled = float(inner["origSz"]) - float(inner["sz"])
+                except (KeyError, TypeError, ValueError):
+                    filled = float("nan")
+                terminal = (status in ("filled", "canceled", "rejected")
+                            or status.endswith("Canceled") or status.endswith("Rejected"))
+                if terminal and math.isfinite(filled) and 0 <= filled <= qty:
                     return {"status": status, "filled_base": filled,
                             "avg_px": None, "err": None, "unresolved": False}
             await asyncio.sleep(0.5)
         return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
-                "err": None, "unresolved": True}
+                "err": f"cloid={cloid.to_raw()}", "unresolved": True}
 
     async def _post_exchange(self, payload: dict):
         try:
@@ -241,6 +243,8 @@ class HLVenue:
                 text = await r.text()
                 if r.status == 429:
                     return None, f"RATE_LIMITED: HTTP 429 {text[:150]}", False
+                if r.status == 408:
+                    return None, None, True
                 if 400 <= r.status < 500:
                     return None, f"HTTP {r.status}: {text[:250]}", False
                 if r.status >= 500:
@@ -251,25 +255,37 @@ class HLVenue:
 
     @staticmethod
     def _parse(body: dict) -> dict:
+        def unknown(msg: str) -> dict:
+            return {"status": "unknown", "filled_base": 0.0, "avg_px": None,
+                    "err": msg, "unresolved": True}
+
         def fail(msg: str) -> dict:
             low = msg.lower()
             if "rate limit" in low or "too many" in low:
                 msg = "RATE_LIMITED: " + msg
             return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
                     "err": msg, "unresolved": False}
+        if not isinstance(body, dict):
+            return unknown("non-object exchange response")
         if body.get("status") == "err":
             return fail(str(body.get("response")))
         if body.get("status") != "ok":
-            return fail(f"unexpected response: {str(body)[:200]}")
+            return unknown(f"unexpected response: {str(body)[:200]}")
         try:
             st = body["response"]["data"]["statuses"][0]
         except (KeyError, IndexError, TypeError):
-            return fail(f"malformed response: {str(body)[:200]}")
+            return unknown(f"malformed response: {str(body)[:200]}")
+        if not isinstance(st, dict):
+            return unknown(f"malformed status: {str(st)[:150]}")
         if "filled" in st:
             f = st["filled"]
-            return {"status": "filled",
-                    "filled_base": float(f.get("totalSz") or 0.0),
-                    "avg_px": float(f["avgPx"]) if f.get("avgPx") else None,
+            try:
+                filled, avg = float(f["totalSz"]), float(f["avgPx"])
+            except (KeyError, TypeError, ValueError):
+                return unknown("malformed fill")
+            if not (math.isfinite(filled) and filled > 0 and math.isfinite(avg) and avg > 0):
+                return unknown("invalid fill values")
+            return {"status": "filled", "filled_base": filled, "avg_px": avg,
                     "err": None, "unresolved": False}
         if "error" in st:
             msg = str(st["error"])
@@ -280,7 +296,7 @@ class HLVenue:
         if "resting" in st:
             return {"status": "resting?", "filled_base": 0.0, "avg_px": None,
                     "err": None, "unresolved": True}
-        return fail(f"unknown status: {str(st)[:150]}")
+        return unknown(f"unknown status: {str(st)[:150]}")
 
     # -------------------------------------------------------------- accounts
 
@@ -325,11 +341,20 @@ class HLVenue:
         assert addr is not None
         st = await self._info({"type": "clearinghouseState", "user": addr,
                                "dex": self.conf.hl_dex})
-        for ap in st.get("assetPositions") or []:
+        if not isinstance(st, dict) or not isinstance(st.get("assetPositions"), list):
+            raise RuntimeError("Malformed Entropy account state")
+        for ap in st["assetPositions"]:
             pos = ap.get("position") or {}
             if pos.get("coin") == self.coin:
-                return float(pos.get("szi") or 0.0)
+                return float(pos["szi"])
         return 0.0
+
+    async def fetch_open_orders(self) -> list:
+        orders = await self._info({"type": "openOrders", "user": self._query_address(),
+                                   "dex": self.conf.hl_dex})
+        if not isinstance(orders, list):
+            raise RuntimeError("Malformed Entropy open orders response")
+        return [order for order in orders if order.get("coin") == self.coin]
 
     async def close(self) -> None:
         pass

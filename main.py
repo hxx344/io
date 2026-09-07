@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
-"""entropy-arb entry point.
+"""Fixed four-leg RH/Entropy entry point.
 
-    # collect minute data only — no strategy, no credentials needed
-    python3 main.py --record-only --symbol SNDK --hedge lighter-rh
+    python main.py --record-only --symbol SNDK
+    python main.py --symbol SNDK --cn
 
-    # LIVE trading: real orders, real money (needs .env credentials)
-    python3 main.py --symbol SNDK --hedge lighter-rh
-
---symbol and --hedge are required on every start: the markets you trade are
-an explicit decision, not a config default. Add --cn for a Chinese-language
-dashboard. There is no paper mode. Collect data with --record-only, set
-your thresholds with tools/analyze.py, then go live with small position
-caps.
-
-On a terminal the bot shows a live Rich dashboard (books, signal, positions,
-PnL, last executions) and writes log lines to logging.file; use
---no-dashboard for plain console logs (nohup/systemd). Strategy lives in
-config.yaml, credentials in .env — see the README (English) /
-README.zh-CN.md (中文).
+Config: config.yaml. Credentials: .env (Entropy only).
+RH is always virtual. Default direction is randomized once per cycle.
 """
 import argparse
 import asyncio
@@ -57,7 +45,10 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
     eng = Engine(cfg, record_only=record_only)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, eng.request_stop)
+        try:
+            loop.add_signal_handler(sig, eng.request_stop)
+        except NotImplementedError:  # Windows event loops
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(eng.request_stop))
     if not use_dashboard:
         await eng.run()
         return
@@ -77,16 +68,15 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Two-venue LIVE arbitrage: Entropy vs Lighter mainnet / "
-                    "Lighter Robinhood / trade.xyz. Without --record-only, "
-                    "real orders are sent.")
+        description="Fixed 4LEG: Lighter RH virtual entry -> Entropy open -> "
+                    "Lighter RH virtual exit -> Entropy reduce-only close. "
+                    "Each cycle randomly chooses long/short by default.")
     p.add_argument("--symbol", required=True,
                    help="symbol traded on both venues, e.g. SNDK / "
                         "两个交易所共同交易的品种")
-    p.add_argument("--hedge", required=True, choices=HEDGE_VENUES,
+    p.add_argument("--hedge", default="lighter-rh", choices=HEDGE_VENUES,
                    metavar="VENUE",
-                   help=f"hedge venue, one of: {', '.join(HEDGE_VENUES)} / "
-                        f"对冲腿，三选一")
+                   help="fixed virtual reference: lighter-rh (default)")
     p.add_argument("--config", default="config.yaml",
                    help="strategy config (default: config.yaml)")
     p.add_argument("--env-file", default=".env",
