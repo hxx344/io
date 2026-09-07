@@ -1,8 +1,8 @@
-# Fixed four legs: RH virtual -> Entropy open -> RH virtual -> Entropy reduce-only close.
+# Fixed four legs: RH virtual -> Entropy market open -> RH virtual -> market reduce-only close.
 cycle:
   direction: random            # random (50/50 each cycle), long, short
   cycles: 0                    # 0 = repeat until stopped
-  virtual_offset_bps: 2.0       # 1 bps = 0.01%; buy below bid, sell above ask
+  virtual_depth: 4              # 1-based depth: virtual buy at bid N, virtual sell at ask N
   virtual_requote_sec: 3.0      # fixed limit until touched or timeout; then re-arm
   max_hold_sec: 0.0             # 0 = wait for LEG3; >0 = close after this many seconds
   state_file: logs/cycle.json   # keep between restarts; also used for process locking
@@ -22,7 +22,8 @@ sizing:
 execution:
   cooldown_sec: 2.0
   settle_timeout_sec: 5.0
-  leg_slippage_bps: 20.0        # IOC limit bounded from Entropy BBO
+  leg2_slippage_bps: 20.0       # entry market slippage cap; 20 bps = 0.20%
+  leg4_slippage_bps: 20.0       # exit market slippage cap; same protection across retries
   max_order_attempts: 3
   retry_delay_sec: 1.0
   rate_limit_pause_sec: 10.0

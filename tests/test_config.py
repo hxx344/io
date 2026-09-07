@@ -32,14 +32,14 @@ def test_only_entropy_credentials_required(load, monkeypatch):
 def test_example():
     path = Path(__file__).resolve().parents[1] / "config.example.yaml"
     cfg = load_config(str(path), "missing.env", symbol="SNDK")
-    assert cfg.direction == "random" and cfg.virtual_offset_bps == 2
+    assert cfg.direction == "random" and cfg.virtual_depth == 4
 
 
 @pytest.mark.parametrize("text", [
     "thresholds: {midline_bps: 0}", "hedge: {taker_fee_bps: 0}",
     "entropy: {dex: xyz}", "cycle: {direction: buy}", "cycle: {cycles: -1}",
-    "cycle: {cycles: true}", "cycle: {virtual_offset_bps: 0}",
-    "cycle: {virtual_offset_bps: 10000}", "cycle: {virtual_requote_sec: 0}",
+    "cycle: {cycles: true}", "cycle: {virtual_depth: 0}",
+    "cycle: {virtual_depth: -1}", "cycle: {virtual_depth: 1.5}", "cycle: {virtual_depth: true}", "cycle: {virtual_requote_sec: 0}",
     "cycle: {max_hold_sec: -1}", "sizing: {quantity: .nan}", "sizing: {quantity: .inf}",
     "sizing: {quantity: -1}", "sizing: {max_order_notional_usd: 1}",
     "execution: {max_order_attempts: 0}", "execution: {leg_slippage_bps: 10000}",
@@ -55,3 +55,20 @@ def test_invalid_config(load, text):
 def test_other_venues_rejected(load, venue):
     with pytest.raises(ConfigError, match="fixed"):
         load(hedge_venue=venue)
+
+@pytest.mark.parametrize("key", ["leg2_slippage_bps", "leg4_slippage_bps"])
+@pytest.mark.parametrize("value", ["-1", "10000", ".nan", ".inf"])
+def test_invalid_per_leg_slippage(load, key, value):
+    with pytest.raises(ConfigError):
+        load(f"execution: {{{key}: {value}}}")
+
+
+def test_depth_and_independent_slippage_config(load):
+    cfg = load("cycle: {virtual_depth: 8}\nexecution: {leg2_slippage_bps: 12, leg4_slippage_bps: 25}")
+    assert cfg.virtual_depth == 8
+    assert cfg.leg2_slippage_bps == 12 and cfg.leg4_slippage_bps == 25
+
+
+def test_old_virtual_offset_requires_migration(load):
+    with pytest.raises(ConfigError, match="virtual_offset_bps"):
+        load("cycle: {virtual_offset_bps: 2}")

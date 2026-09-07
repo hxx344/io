@@ -4,16 +4,18 @@
 
 Forked from [your-quantguy/entropy-arb](https://github.com/your-quantguy/entropy-arb), with sequential virtual-maker triggering based on [hxx344/perp](https://github.com/hxx344/perp/blob/76d8e8e620ca65a0af9c90163a93b0d53f319468/strategies/aster_lighter_cycle.py).
 
-Every cycle independently chooses long or short with equal probability. LEG1 and LEG3 are local virtual limit orders driven exclusively by Lighter Robinhood public books. Only LEG2 and LEG4 send real orders on Entropy (`io` on Hyperliquid).
+Every cycle independently chooses long or short with equal probability. LEG1 and LEG3 are local virtual limit orders driven exclusively by Lighter Robinhood public books. Only LEG2 and LEG4 execute real slippage-protected market orders on Entropy (`io` on Hyperliquid).
 
 | Leg | Long cycle | Short cycle |
 | --- | --- | --- |
-| LEG1: RH virtual entry | Virtual sell above ask; wait for bid >= limit | Virtual buy below bid; wait for ask <= limit |
-| LEG2: Entropy entry | IOC buy to open long | IOC sell to open short |
-| LEG3: RH virtual exit | After confirmed entry, virtual buy below current bid | After confirmed entry, virtual sell above current ask |
-| LEG4: Entropy exit | IOC reduce-only sell | IOC reduce-only buy |
+| LEG1: RH virtual entry | Virtual sell at RH ask level 4; wait for bid >= limit | Virtual buy at RH bid level 4; wait for ask <= limit |
+| LEG2: Entropy entry | Market buy to open long | Market sell to open short |
+| LEG3: RH virtual exit | After confirmed entry, virtual buy at current RH bid level 4 | After confirmed entry, virtual sell at current RH ask level 4 |
+| LEG4: Entropy exit | Market reduce-only sell | Market reduce-only buy |
 
-Virtual limits use `virtual_offset_bps` beyond RH BBO, rounded outward to RH price precision. Each price stays fixed until touched or its re-quote timeout expires. A new RH book update must cross the limit; reconnects and sequence gaps invalidate the old virtual order. Virtual fills model BBO touches, not queue priority or traded volume. Entropy IOC limits use Entropy's own BBO and the configured slippage cap. No premium, fee, or profit threshold gates the exit.
+Virtual limits use the actual Nth RH bid (buy) or ask (sell), controlled by `cycle.virtual_depth` (default 4, one-based). No percentage offset is added. If that side has fewer than N valid price levels, the strategy waits instead of falling back to BBO. Each price stays fixed until touched or its re-quote timeout expires. A new RH book update must cross the limit; reconnects and sequence gaps invalidate the old virtual order. Virtual fills model BBO touches, not queue priority or traded volume.
+
+Entropy market execution follows [Hyperliquid's official market_open/market_close wire format](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/exchange.py): aggressive IOC orders with price protection; any unfilled remainder is canceled and never rests on the book. `execution.leg2_slippage_bps` and `execution.leg4_slippage_bps` independently cap entry/exit slippage. Each leg captures Entropy's ask for buys or bid for sells immediately before its first submission. Buy protection is at most `ask * (1 + bps/10000)`; sell protection is at least `bid * (1 - bps/10000)`, rounded inside the cap. Retries retain the same reference and protection price; the next leg gets a new reference. A strict slippage cap can leave an order unfilled or partially filled, with the existing bounded retry/halt handling. No premium, fee, or profit threshold gates the exit.
 
 ## Run
 
@@ -39,9 +41,21 @@ python main.py --symbol SNDK --cn
 python main.py --symbol SNDK --no-dashboard
 ```
 
-`--symbol` must exist on both exchanges; IDs and precision are resolved dynamically. `--hedge lighter-rh` is optional and fixed. Old `thresholds`, `inventory`, and `hedge` configuration blocks are rejected; use the new example.
+`--symbol` must exist on both exchanges; IDs and precision are resolved dynamically. `--hedge lighter-rh` is optional and fixed. Old `thresholds`, `inventory`, and `hedge` configuration blocks are rejected; use the new example. Replace the previous `cycle.virtual_offset_bps` with `cycle.virtual_depth: 4`.
 
-Configure `cycle.direction` (`random`, `long`, `short`), `cycle.cycles` (0 = continuous), `cycle.virtual_offset_bps` (default 2), `cycle.virtual_requote_sec` (default 3), and `sizing.quantity` (>0 = fixed base size; 0 = default $50 notional). Sizes round down using Entropy precision only. `cycle.max_hold_sec` defaults to 0 (wait for LEG3); a positive value closes via LEG4 at the holding deadline.
+Configure `cycle.direction` (`random`, `long`, `short`), `cycle.cycles` (0 = continuous), `cycle.virtual_depth` (default 4), `cycle.virtual_requote_sec` (default 3), and `sizing.quantity` (>0 = fixed base size; 0 = default $50 notional). Sizes round down using Entropy precision only. `cycle.max_hold_sec` defaults to 0 (wait for LEG3); a positive value closes via LEG4 at the holding deadline.
+
+For example, use bid/ask level 6 with 0.10% entry slippage and 0.15% exit slippage:
+
+```yaml
+cycle:
+  virtual_depth: 6
+execution:
+  leg2_slippage_bps: 10
+  leg4_slippage_bps: 15
+```
+
+Both leg-specific slippage settings default to 20 bps (0.20%). When an override is absent, the legacy `execution.leg_slippage_bps` supplies its fallback. Restart after editing configuration.
 
 ## Settlement and restart behavior
 
@@ -60,6 +74,6 @@ python -X utf8 -m pip install pytest
 python -X utf8 -m pytest -q
 ```
 
-Tests simulate all submissions, including official SDK signing, IOC/reduce-only wire fields, full long/short cycles, partial fills, uncertain settlement, re-quotes, feed gaps, stopping, and durable state/locking.
+Tests simulate all submissions, including official SDK signing, IOC/reduce-only wire fields, bid/ask depth selection, insufficient depth, per-leg slippage caps across retries, full long/short cycles, partial fills, uncertain settlement, re-quotes, feed gaps, stopping, and durable state/locking.
 
 API references: [Hyperliquid exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint), [Lighter RH WebSocket](https://apidocs.rh.lighter.xyz/docs/websocket). Upstream MIT license retained.

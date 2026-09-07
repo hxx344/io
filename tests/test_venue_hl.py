@@ -52,7 +52,7 @@ def test_real_sdk_signs_ioc_reduce_only_and_unique_cloids():
             {"status": "ok", "response": {"data": {"statuses": [
                 {"filled": {"totalSz": "0.2", "avgPx": "100"}}]}}}, None, False))
         for is_buy in (False, True):
-            result = await v.send_taker(is_buy=is_buy, qty=.2, limit_px=100, reduce_only=True)
+            result = await v.send_market(is_buy=is_buy, qty=.2, reference_px=100, slippage_bps=20, reduce_only=True)
             assert result["filled_base"] == .2
         payloads = [call.args[0] for call in v._post_exchange.call_args_list]
         for payload in payloads:
@@ -70,7 +70,7 @@ def test_ambiguous_post_resolves_terminal_partial_fill_by_cloid():
         v._post_exchange = AsyncMock(return_value=(None, None, True))
         v._info = AsyncMock(return_value={"status": "order", "order": {
             "status": "canceled", "order": {"origSz": "1", "sz": "0.7"}}})
-        result = await v.send_taker(is_buy=True, qty=1, limit_px=100)
+        result = await v.send_market(is_buy=True, qty=1, reference_px=100, slippage_bps=20)
         assert result["filled_base"] == pytest.approx(.3) and not result["unresolved"]
         payload = v._post_exchange.call_args.args[0]
         assert v._info.call_args.args[0]["oid"] == payload["action"]["orders"][0]["c"]
@@ -84,7 +84,7 @@ def test_nonterminal_order_status_cannot_confirm_a_fill(status):
         v._post_exchange = AsyncMock(return_value=(None, None, True))
         v._info = AsyncMock(return_value={"status": "order", "order": {
             "status": status, "order": {"origSz": "1", "sz": "0"}}})
-        result = await v.send_taker(is_buy=True, qty=1, limit_px=100)
+        result = await v.send_market(is_buy=True, qty=1, reference_px=100, slippage_bps=20)
         assert result["unresolved"] and result["err"].startswith("cloid=")
         assert v._post_exchange.await_count == 1
     asyncio.run(scenario())
@@ -110,4 +110,35 @@ def test_open_orders_filter_selected_market():
         v._info = AsyncMock(return_value=[{"coin": "io:TEST", "oid": 1}, {"coin": "io:OTHER", "oid": 2}])
         assert await v.fetch_open_orders() == [{"coin": "io:TEST", "oid": 1}]
         assert v._info.call_args.args[0]["dex"] == "io"
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("is_buy,reduce_only", [(True, False), (False, False), (True, True), (False, True)])
+def test_market_wire_enforces_slippage_for_open_and_close(is_buy, reduce_only):
+    async def scenario():
+        v = venue()
+        v._post_exchange = AsyncMock(return_value=(
+            {"status": "ok", "response": {"data": {"statuses": [
+                {"filled": {"totalSz": "0.2", "avgPx": "100"}}]}}}, None, False))
+        reference, slip = 100.123, 7.0
+        await v.send_market(is_buy=is_buy, qty=.2, reference_px=reference,
+                            slippage_bps=slip, reduce_only=reduce_only)
+        order = v._post_exchange.call_args.args[0]["action"]["orders"][0]
+        limit = float(order["p"])
+        assert order["b"] == is_buy and order["r"] == reduce_only
+        assert order["t"] == {"limit": {"tif": "Ioc"}}
+        if is_buy:
+            assert reference <= limit <= reference * (1 + slip / 10000)
+        else:
+            assert reference >= limit >= reference * (1 - slip / 10000)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reference,slip", [(0, 20), (float("nan"), 20), (100, -1), (100, 10000), (100, float("inf"))])
+def test_market_invalid_slippage_never_submits(reference, slip):
+    async def scenario():
+        v = venue()
+        v._post_exchange = AsyncMock()
+        with pytest.raises(ValueError):
+            await v.send_market(is_buy=True, qty=1, reference_px=reference, slippage_bps=slip)
+        assert v._post_exchange.await_count == 0
     asyncio.run(scenario())

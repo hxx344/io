@@ -48,6 +48,7 @@ class Engine:
         self._step = 0.0001
         self._last_reconcile = 0.0
         self._exposure_since = 0.0
+        self._market_references = {}
         self.recorder = None
 
     def request_stop(self):
@@ -202,33 +203,41 @@ class Engine:
                 if now < order["expires"]:
                     await self._pulse()
                     continue
-            # Fixed price during each waiting interval; timeout re-arms from the latest BBO.
-            reference = book.best_bid() if is_buy else book.best_ask()
-            fraction = self.cfg.virtual_offset_bps / 10000
-            price = self.hedge.px_round(reference * (1 - fraction if is_buy else 1 + fraction),
-                                        round_up=not is_buy)
-            if price <= 0:
-                self._halt("Virtual limit rounded to zero; increase price precision/offset")
+            # Use the actual Nth price level, not a BBO percentage offset.
+            levels = book.sorted_bids() if is_buy else book.sorted_asks()
+            levels = [(px, size) for px, size in levels
+                      if math.isfinite(px) and px > 0 and math.isfinite(size) and size > 0]
+            if len(levels) < self.cfg.virtual_depth:
+                self.virtual_order = None
+                await self._pulse()
+                continue
+            price = levels[self.cfg.virtual_depth - 1][0]
             self.virtual_order = {"leg": leg, "side": "buy" if is_buy else "sell",
                                   "price": price, "revision": book.revision,
                                   "generation": book.generation,
+                                  "depth": self.cfg.virtual_depth,
                                   "qty": qty or self._entry_quantity(self.direction == "long"),
                                   "expires": now + self.cfg.virtual_requote_sec}
-            log.info("cycle=%d %s RH virtual %s qty=%g limit=%g", self.cycle, leg,
-                     self.virtual_order["side"], self.virtual_order["qty"], price)
+            log.info("cycle=%d %s RH virtual %s depth=%d qty=%g limit=%g", self.cycle, leg,
+                     self.virtual_order["side"], self.cfg.virtual_depth,
+                     self.virtual_order["qty"], price)
             await self._pulse()
         self.virtual_order = None
         return False
 
-    def _limit(self, is_buy):
-        book = self.entropy.book
-        fraction = self.cfg.leg_slippage_bps / 10000
-        price = book.best_ask() * (1 + fraction) if is_buy else book.best_bid() * (1 - fraction)
-        # Round inside the requested slippage cap, not beyond it.
-        return self.entropy.px_round(price, round_up=not is_buy)
+    def _slippage(self, leg):
+        override = self.cfg.leg2_slippage_bps if leg == "LEG2" else self.cfg.leg4_slippage_bps
+        return self.cfg.leg_slippage_bps if override is None else override
 
-    def _entry_quantity(self, is_buy):
-        price = self._limit(is_buy)
+    def _market_reference(self, is_buy):
+        return self.entropy.book.best_ask() if is_buy else self.entropy.book.best_bid()
+
+    def _limit(self, is_buy, reference_px=None, leg="LEG2"):
+        reference_px = self._market_reference(is_buy) if reference_px is None else reference_px
+        return self.entropy.market_limit(is_buy, reference_px, self._slippage(leg))
+
+    def _entry_quantity(self, is_buy, reference_px=None):
+        price = self._limit(is_buy, reference_px)
         if price <= 0:
             self._halt("Entropy order limit is not positive")
         risk_price = max(price, self.entropy.book.best_ask())
@@ -260,15 +269,15 @@ class Engine:
                 self._halt("Timed out waiting for fresh Entropy book/order budget")
             await self._pulse()
 
-    async def _send(self, leg, is_buy, qty, closing, reason=""):
+    async def _send(self, leg, is_buy, qty, closing, reference_px, reason=""):
         # Checkpoint precedes submission: a crash cannot restart an uncertain order.
         self.state = leg + "_PENDING"
         self._save()
         self._sends.append(time.monotonic())
-        limit = self._limit(is_buy)
+        limit = self._limit(is_buy, reference_px, leg)
         try:
-            result = await self.entropy.send_taker(is_buy=is_buy, qty=qty,
-                                                  limit_px=limit, reduce_only=closing)
+            result = await self.entropy.send_market(is_buy=is_buy, qty=qty,
+                reference_px=reference_px, slippage_bps=self._slippage(leg), reduce_only=closing)
         except Exception as exc:
             self._halt(f"{leg} submission outcome unknown: {exc}")
         if result.get("unresolved"):
@@ -292,6 +301,7 @@ class Engine:
 
     async def _open_position(self):
         is_buy = self.direction == "long"
+        reference_px = self._market_references.get("LEG2")
         for attempt in range(self.cfg.max_order_attempts):
             if not await self._wait_send_ready(closing=False):
                 return False
@@ -299,8 +309,11 @@ class Engine:
             if not await self._wait_send_ready(closing=False):
                 return False
             # Size is recomputed at the executable Entropy price after the virtual trigger.
-            qty = self._entry_quantity(is_buy)
-            filled = await self._send("LEG2", is_buy, qty, closing=False)
+            if reference_px is None:
+                reference_px = self._market_reference(is_buy)
+                self._market_references["LEG2"] = reference_px
+            qty = self._entry_quantity(is_buy, reference_px)
+            filled = await self._send("LEG2", is_buy, qty, closing=False, reference_px=reference_px)
             if filled > 0:
                 self._exposure_since = time.monotonic()
                 return True  # partial entry accepted, never top up blindly
@@ -309,6 +322,7 @@ class Engine:
         self._halt("LEG2 exhausted attempts without a fill")
 
     async def _close_position(self, reason="trigger"):
+        reference_px = self._market_references.get("LEG4")
         self.virtual_order = None
         self.state = "LEG4"
         self._save()
@@ -322,7 +336,11 @@ class Engine:
             qty = floor_step(self.remaining, self._step)
             if qty < self._step:
                 self._halt("Uncloseable Entropy residual")
-            await self._send("LEG4", self.direction == "short", qty, closing=True, reason=reason)
+            if reference_px is None:
+                reference_px = self._market_reference(self.direction == "short")
+                self._market_references["LEG4"] = reference_px
+            await self._send("LEG4", self.direction == "short", qty, closing=True,
+                             reference_px=reference_px, reason=reason)
             if self.remaining < self._step / 2:
                 return
             if attempt + 1 < self.cfg.max_order_attempts:
@@ -343,6 +361,7 @@ class Engine:
                     break
                 await self._confirm_position(0.0)
                 self.cycle += 1
+                self._market_references.clear()
                 self.direction = (self._rng.choice(("long", "short"))
                                   if self.cfg.direction == "random" else self.cfg.direction)
                 self.state = "LEG1"

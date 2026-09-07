@@ -6,10 +6,11 @@ OFFICIAL websocket (see feeds.HLBookFeed). Trading lazily imports the
 official `hyperliquid-python-sdk` signing helpers + eth_account —
 --record-only data collection needs neither.
 
-IOC limit orders settle synchronously in the /exchange response; unknown
+Slippage-protected market orders use aggressive IOC limits, as in the
+official SDK's market_open/market_close methods. They never rest on the book.
+IOC orders settle synchronously in the /exchange response; unknown
 outcomes (timeout/5xx) fall back to orderStatus-by-cloid polling inside
-send_taker(), so the engine sees the same unified result shape as the Lighter
-venue: {status, filled_base, avg_px, err, unresolved}.
+send_market(): {status, filled_base, avg_px, err, unresolved}.
 """
 from __future__ import annotations
 
@@ -178,8 +179,34 @@ class HLVenue:
         from hyperliquid.utils.types import Cloid
         return Cloid.from_int(uuid.uuid4().int)
 
-    async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
-                         reduce_only: bool = False) -> dict:
+    def market_limit(self, is_buy: bool, reference_px: float, slippage_bps: float) -> float:
+        """Hard worst-fill price, rounded inward so ticks cannot widen slippage."""
+        if not math.isfinite(reference_px) or reference_px <= 0:
+            raise ValueError("Market reference price must be finite and positive")
+        if not math.isfinite(slippage_bps) or not 0 <= slippage_bps < 10000:
+            raise ValueError("Market slippage_bps must be in [0, 10000)")
+        fraction = slippage_bps / 10000
+        raw = reference_px * (1 + fraction if is_buy else 1 - fraction)
+        limit = self.px_round(raw, round_up=not is_buy)
+        if limit <= 0:
+            raise ValueError("Market protection price rounds to zero")
+        return limit
+
+    async def send_market(self, *, is_buy: bool, qty: float, reference_px: float,
+                          slippage_bps: float, reduce_only: bool = False) -> dict:
+        """Market open/close with mandatory slippage protection; wire format is IOC.
+
+        The engine supplies a fixed Entropy BBO reference per leg, including
+        retries. RH virtual prices are never used as execution prices.
+        """
+        limit_px = self.market_limit(is_buy, reference_px, slippage_bps)
+        log.info("[%s] MARKET reference=%g slippage_bps=%g protection=%g",
+                 self.name, reference_px, slippage_bps, limit_px)
+        return await self._send_ioc(is_buy=is_buy, qty=qty, limit_px=limit_px,
+                                    reduce_only=reduce_only)
+
+    async def _send_ioc(self, *, is_buy: bool, qty: float, limit_px: float,
+                        reduce_only: bool = False) -> dict:
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
         cloid = self._next_cloid()

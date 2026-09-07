@@ -2,18 +2,20 @@
 
 基于 [your-quantguy/entropy-arb](https://github.com/your-quantguy/entropy-arb) 修改；四腿执行顺序及虚拟触价规则参考 [hxx344/perp 的 aster_lighter_cycle](https://github.com/hxx344/perp/blob/76d8e8e620ca65a0af9c90163a93b0d53f319468/strategies/aster_lighter_cycle.py)。[English](README.md)
 
-每轮独立按 50/50 随机选择追多或追空，选定方向后整轮保持不变。LEG1、LEG3 固定是 Lighter Robinhood 的本地虚拟限价单；LEG2、LEG4 固定只在 Entropy（Hyperliquid `io` dex）发送真实 IOC 限价单。
+每轮独立按 50/50 随机选择追多或追空，选定方向后整轮保持不变。LEG1、LEG3 固定是 Lighter Robinhood 的本地虚拟限价单；LEG2、LEG4 固定只在 Entropy（Hyperliquid `io` dex）执行带滑点保护的真实市价单。
 
 | 腿 | 随机选中追多 | 随机选中追空 |
 | --- | --- | --- |
-| LEG1：RH 虚拟入场 | 在当前卖一之上挂虚拟卖单，等待 RH 买一 ≥ 挂价 | 在当前买一之下挂虚拟买单，等待 RH 卖一 ≤ 挂价 |
-| LEG2：Entropy 开仓 | 买入开多 | 卖出开空 |
-| LEG3：RH 虚拟出场 | LEG2 确认后，在当时买一之下挂虚拟买单，等待卖一 ≤ 挂价 | LEG2 确认后，在当时卖一之上挂虚拟卖单，等待买一 ≥ 挂价 |
-| LEG4：Entropy 平仓 | `reduce_only` 卖出平多 | `reduce_only` 买入平空 |
+| LEG1：RH 虚拟入场 | 在 RH 卖四挂虚拟卖单，等待 RH 买一 ≥ 挂价 | 在 RH 买四挂虚拟买单，等待 RH 卖一 ≤ 挂价 |
+| LEG2：Entropy 开仓 | 市价买入开多 | 市价卖出开空 |
+| LEG3：RH 虚拟出场 | LEG2 确认后，在当时 RH 买四挂虚拟买单，等待卖一 ≤ 挂价 | LEG2 确认后，在当时 RH 卖四挂虚拟卖单，等待买一 ≥ 挂价 |
+| LEG4：Entropy 平仓 | `reduce_only` 市价卖出平多 | `reduce_only` 市价买入平空 |
 
-这里的“虚拟成交”是公共盘口触价模拟，不向 RH 提交订单，也不模拟排队优先级或真实成交量。虚拟卖单价为 `ask × (1 + offset_bps / 10000)` 并向上按 RH 精度取整；虚拟买单价为 `bid × (1 - offset_bps / 10000)` 并向下取整。每次挂价固定，到价才触发，超时则按最新行情重新挂价。只有挂单之后的新盘口更新可以触发；断线或盘口 nonce 缺口后重新挂价。
+这里的“虚拟成交”是公共盘口触价模拟，不向 RH 提交订单，也不模拟排队优先级或真实成交量。虚拟买单取 RH 买盘按价格从高到低排列的第 N 档，虚拟卖单取卖盘从低到高排列的第 N 档；`cycle.virtual_depth` 默认是 4，可改成 1、2、5、10 等正整数。直接使用该档真实价格，不叠加偏移；对应盘口不足 N 档时等待补足，不退回买一／卖一。挂价固定到触发或超时，超时后按最新第 N 档重新挂价。只有挂单之后的新盘口更新可以触发；断线或盘口 nonce 缺口后重新挂价。
 
-例如，LEG1 虚拟卖单挂在 RH 现价上方；RH 买一涨到挂价后，LEG2 在 Entropy 追多。确认实际成交数量后，才在 RH 当前价格下方挂 LEG3 虚拟买单；RH 卖一下跌到挂价后，LEG4 平掉本轮多仓。平仓不额外等待价差、盈利或手续费门槛。
+LEG2 和 LEG4 均为市价执行，分别由 `execution.leg2_slippage_bps`、`execution.leg4_slippage_bps` 控制滑点。Entropy 使用 Hyperliquid 接口，其[官方市价开仓／平仓实现](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/exchange.py)通过带价格保护的 IOC 立即吃单，未成交部分撤销，不留挂单。本项目沿用这个协议实现，保留异步成交确认。每条实盘腿在首次提交前读取 Entropy 自身盘口：买入保护价不高于 `ask × (1 + 滑点bps / 10000)`，卖出保护价不低于 `bid × (1 - 滑点bps / 10000)`，价格精度向保护范围内取整。同一腿的重试沿用首次参考价和滑点上限，不因行情移动扩大允许滑点；下一条腿重新取价。超过保护范围的数量可能不成交，耗尽重试后停机并保留状态。
+
+例如，LEG1 虚拟卖单挂在 RH 卖四；RH 买一涨到挂价后，LEG2 在 Entropy 追多。确认实际成交数量后，才在 RH 当时的买四挂 LEG3 虚拟买单；RH 卖一下跌到挂价后，LEG4 平掉本轮多仓。平仓不额外等待价差、盈利或手续费门槛。
 
 ## 安装与运行
 
@@ -44,7 +46,7 @@ python main.py --symbol SNDK --cn
 python main.py --symbol SNDK --no-dashboard
 ```
 
-`--hedge lighter-rh` 可省略；其他交易所会被拒绝。原版 `thresholds`、`inventory`、`hedge` 配置块不再使用，旧配置会明确报错，请从新示例复制。
+`--hedge lighter-rh` 可省略；其他交易所会被拒绝。原版 `thresholds`、`inventory`、`hedge` 配置块不再使用，旧配置会明确报错，请从新示例复制。上一版的 `cycle.virtual_offset_bps` 请删除，改为 `cycle.virtual_depth: 4`。
 
 ## 主要配置
 
@@ -52,16 +54,29 @@ python main.py --symbol SNDK --no-dashboard
 | --- | --- | --- |
 | `cycle.direction` | `random` | 每轮随机多空；也支持 `long`、`short` |
 | `cycle.cycles` | `0` | `0` 持续循环；正整数限制完成轮数 |
-| `cycle.virtual_offset_bps` | `2.0` | 虚拟挂价距离；1 bps = 0.01% |
+| `cycle.virtual_depth` | `4` | 虚拟买单取买 N、虚拟卖单取卖 N；从 1 开始计数 |
 | `cycle.virtual_requote_sec` | `3.0` | 虚拟单等待多久后重挂；重挂不改变本轮方向 |
 | `cycle.max_hold_sec` | `0` | `0` 一直等 LEG3；正数表示持仓超时直接走 LEG4 平仓 |
 | `sizing.quantity` | `0` | 大于 0 时固定基础币数量；0 时按美元名义金额计算 |
 | `sizing.order_notional_usd` | `50` | 按 Entropy 当前可执行价格计算数量 |
 | `sizing.max_order_notional_usd` | `500` | 单次开仓上限 |
 | `entropy.max_position_usd` | `1000` | Entropy 开仓名义金额上限 |
-| `execution.leg_slippage_bps` | `20` | Entropy IOC 相对其自身买卖一价的价格保护 |
+| `execution.leg2_slippage_bps` | `20` | LEG2 市价开仓滑点上限；20 bps = 0.20% |
+| `execution.leg4_slippage_bps` | `20` | LEG4 市价平仓滑点上限；20 bps = 0.20% |
 | `execution.max_order_attempts` | `3` | 已明确未成交的开仓、部分平仓的最大尝试次数 |
 | `execution.cooldown_sec` | `2` | 完成一轮后间隔 |
+
+例如改为买六／卖六，开仓允许 0.10%、平仓允许 0.15%：
+
+```yaml
+cycle:
+  virtual_depth: 6
+execution:
+  leg2_slippage_bps: 10
+  leg4_slippage_bps: 15
+```
+
+修改配置后重启生效。旧的 `execution.leg_slippage_bps` 仍可用作公共默认值；未单独设置的腿使用这个默认值（20 bps）。
 
 数量按 Entropy 数量精度向下取整，不受 RH 虚拟腿最小下单量约束。LEG2 部分成交后直接使用确认成交量执行 LEG3/LEG4，不补足开仓。LEG4 每次只平剩余数量，始终设置 `reduce_only`；低于交易所最低名义金额的残仓仍尝试 reduce-only 关闭，若交易所拒绝且重试耗尽则停机保留状态。
 
@@ -82,6 +97,6 @@ python -X utf8 -m pip install pytest
 python -X utf8 -m pytest -q
 ```
 
-测试覆盖随机多空完整顺序、虚拟触价与重挂、断线/旧消息、部分成交、限频、订单结果不明、仓位不一致、停止与残仓、状态恢复、Windows/Unix 进程锁，以及官方 Hyperliquid SDK 的 IOC / reduce-only 签名格式。所有订单测试均使用模拟传输。
+测试覆盖随机多空完整顺序、买卖档位选择、深度不足、虚拟触价与重挂、断线/旧消息、部分成交、限频、订单结果不明、仓位不一致、停止与残仓、状态恢复、Windows/Unix 进程锁，以及官方 Hyperliquid SDK 的市价 IOC / reduce-only 签名格式、买卖滑点边界及跨重试保护价。所有订单测试均使用模拟传输。
 
 API 依据：[Hyperliquid Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)、[Lighter RH WebSocket](https://apidocs.rh.lighter.xyz/docs/websocket)。保留上游 MIT 许可证。

@@ -55,7 +55,7 @@ class Config:
     hedge_venue: str = "lighter-rh"
     direction: str = "random"
     cycles: int = 0
-    virtual_offset_bps: float = 2.0
+    virtual_depth: int = 4  # 1-based RH bid/ask book level
     virtual_requote_sec: float = 3.0
     quantity: float = 0.0  # 0 sizes from order_notional
     order_notional: float = 50.0
@@ -64,6 +64,8 @@ class Config:
     cooldown_sec: float = 2.0
     settle_timeout_sec: float = 5.0
     leg_slippage_bps: float = 20.0
+    leg2_slippage_bps: float | None = None
+    leg4_slippage_bps: float | None = None
     max_order_attempts: int = 3
     retry_delay_sec: float = 1.0
     rate_limit_pause_sec: float = 10.0
@@ -93,7 +95,7 @@ class ConfigError(ValueError):
 
 _SCHEMA = {
     "cycle": {"direction": ("direction", str), "cycles": ("cycles", int),
-              "virtual_offset_bps": ("virtual_offset_bps", float),
+              "virtual_depth": ("virtual_depth", int),
               "virtual_requote_sec": ("virtual_requote_sec", float),
               "max_hold_sec": ("max_hold_sec", float), "state_file": ("state_file", str)},
     "sizing": {"quantity": ("quantity", float), "order_notional_usd": ("order_notional", float),
@@ -101,6 +103,7 @@ _SCHEMA = {
                "min_order_notional_usd": ("min_order_notional", float)},
     "execution": {k: (k, t) for k, t in {
         "cooldown_sec": float, "settle_timeout_sec": float, "leg_slippage_bps": float,
+        "leg2_slippage_bps": float, "leg4_slippage_bps": float,
         "max_order_attempts": int, "retry_delay_sec": float, "rate_limit_pause_sec": float,
         "staleness_sec": float, "reconcile_sec": float, "http_keepalive_sec": float}.items()},
     "recorder": {"enabled": ("recorder_enabled", bool), "csv": ("recorder_csv", str)},
@@ -156,14 +159,16 @@ def load_config(config_file="config.yaml", env_file=".env", *,
     for key in ("cycles", "quantity", "cooldown_sec", "max_hold_sec"):
         if getattr(cfg, key) < 0:
             raise ConfigError(f"{key} must be >= 0")
-    for key in ("virtual_offset_bps", "virtual_requote_sec", "order_notional", "max_order_notional",
+    for key in ("virtual_depth", "virtual_requote_sec", "order_notional", "max_order_notional",
                 "min_order_notional", "settle_timeout_sec", "max_order_attempts", "retry_delay_sec",
                 "rate_limit_pause_sec", "staleness_sec", "reconcile_sec", "http_keepalive_sec",
                 "status_interval_sec"):
         if getattr(cfg, key) <= 0:
             raise ConfigError(f"{key} must be > 0")
-    if not 0 <= cfg.leg_slippage_bps < 10000 or cfg.virtual_offset_bps >= 10000:
-        raise ConfigError("slippage must be in [0, 10000), virtual offset in (0, 10000)")
+    for key in ("leg_slippage_bps", "leg2_slippage_bps", "leg4_slippage_bps"):
+        value = getattr(cfg, key)
+        if value is not None and not 0 <= value < 10000:
+            raise ConfigError(f"{key} must be in [0, 10000)")
     if not cfg.min_order_notional <= cfg.order_notional <= cfg.max_order_notional:
         raise ConfigError("min_order_notional <= order_notional <= max_order_notional required")
     if cfg.entropy.cap_usd <= 0 or cfg.entropy.orders_per_min <= 0 or cfg.entropy.fee_bps < 0:

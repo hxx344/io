@@ -68,8 +68,8 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Fixed 4LEG: Lighter RH virtual entry -> Entropy open -> "
-                    "Lighter RH virtual exit -> Entropy reduce-only close. "
+        description="Fixed 4LEG: Lighter RH virtual depth entry -> Entropy market open -> "
+                    "Lighter RH virtual depth exit -> Entropy market reduce-only close. "
                     "Each cycle randomly chooses long/short by default.")
     p.add_argument("--symbol", required=True,
                    help="symbol traded on both venues, e.g. SNDK / "

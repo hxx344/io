@@ -10,6 +10,7 @@ def test_rh_adapter_has_no_real_order_path():
     rh = LighterVenue(VenueConf("hedge", "lighter", "RH", "TEST",
                                 lighter_profile=LIGHTER_PROFILES["lighter-rh"]), None)
     assert not hasattr(rh, "send_taker")
+    assert not hasattr(rh, "send_market")
     assert not hasattr(rh, "init_signer")
 
 

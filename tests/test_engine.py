@@ -7,6 +7,7 @@ import pytest
 from entropy_arb.book import OrderBook
 from entropy_arb.config import Config, VenueConf
 from entropy_arb.engine import Engine
+from entropy_arb.venue_hl import HLVenue
 
 
 class FakeVenue:
@@ -24,7 +25,9 @@ class FakeVenue:
         self.set_book(99.9, 100.1)
 
     def set_book(self, bid, ask):
-        self.book.apply_hl([[{"px": str(bid), "sz": "10"}], [{"px": str(ask), "sz": "10"}]])
+        self.book.apply_hl([
+            [{"px": str(round(bid - i * .1, 8)), "sz": "10"} for i in range(6)],
+            [{"px": str(round(ask + i * .1, 8)), "sz": "10"} for i in range(6)]])
 
     def px_round(self, price, round_up):
         import math
@@ -33,7 +36,10 @@ class FakeVenue:
     async def fetch_position(self):
         return self.actual if self.position_override is None else self.position_override
 
-    async def send_taker(self, **order):
+    market_limit = HLVenue.market_limit
+
+    async def send_market(self, **order):
+        order["limit_px"] = self.market_limit(order["is_buy"], order["reference_px"], order["slippage_bps"])
         assert self.key == "entropy", "RH must never receive a real order"
         self.calls.append(order)
         result = self.responses.pop(0) if self.responses else {
@@ -338,4 +344,87 @@ def test_invalid_fill_quantity_halts(eng, filled):
             await eng._open_position()
         assert len(eng.entropy.calls) == 1
         assert eng.halted
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("is_buy,depth,expected", [(True, 4, 99.6), (False, 4, 100.4), (True, 1, 99.9), (False, 6, 100.6)])
+def test_virtual_uses_exact_selected_side_depth(eng, is_buy, depth, expected):
+    async def scenario():
+        eng.cfg.virtual_depth = depth
+        eng.direction = "short" if is_buy else "long"
+        task = asyncio.create_task(eng._wait_virtual("LEG1", is_buy, 1))
+        await until(lambda: eng.virtual_order is not None)
+        assert eng.virtual_order["price"] == expected
+        assert eng.virtual_order["depth"] == depth
+        assert not task.done()  # own-side depth is an actual resting virtual price
+        await touch(eng)
+        assert await task
+        assert eng.recent_trades[-1]["limit_px"] == expected
+        assert eng.entropy.calls == []
+    asyncio.run(scenario())
+
+
+def test_missing_depth_waits_instead_of_using_bbo_or_last_level(eng):
+    async def scenario():
+        eng.direction = "long"
+        eng.hedge.book.apply_hl([[{"px": "99.9", "sz": "1"}], [{"px": "100.1", "sz": "1"}]])
+        task = asyncio.create_task(eng._wait_virtual("LEG1", False, 1))
+        await asyncio.sleep(.02)
+        assert eng.virtual_order is None and not task.done()
+        eng.hedge.set_book(99.9, 100.1)
+        eng._update_evt.set()
+        await until(lambda: eng.virtual_order is not None)
+        assert eng.virtual_order["price"] == 100.4
+        eng.request_stop()
+        await task
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_both_market_legs_use_separate_slippage_and_fixed_reference_on_retry(eng, direction):
+    async def scenario():
+        eng.direction = direction
+        eng.cfg.leg2_slippage_bps, eng.cfg.leg4_slippage_bps = 10, 30
+        original_send = eng.entropy.send_market
+        async def send(**order):
+            result = await original_send(**order)
+            # Simulate the quote moving between attempts.
+            bid = eng.entropy.book.best_bid() + 1
+            eng.entropy.set_book(bid, bid + .2)
+            return result
+        eng.entropy.send_market = send
+        eng.entropy.responses = [dict(status="canceled", filled_base=0),
+                                 dict(status="filled", filled_base=1),
+                                 dict(status="filled", filled_base=.4),
+                                 dict(status="filled", filled_base=.6)]
+        assert await eng._open_position()
+        await eng._close_position()
+        calls = eng.entropy.calls
+        assert len(calls) == 4
+        assert [c["slippage_bps"] for c in calls] == [10, 10, 30, 30]
+        assert [c["reduce_only"] for c in calls] == [False, False, True, True]
+        for first, retry in ((calls[0], calls[1]), (calls[2], calls[3])):
+            assert first["reference_px"] == retry["reference_px"]
+            assert first["limit_px"] == retry["limit_px"]
+        assert calls[0]["reference_px"] != calls[2]["reference_px"]
+        assert eng.remaining == 0
+    asyncio.run(scenario())
+
+def test_cleanup_after_recording_error_preserves_exit_slippage_anchor(eng):
+    async def scenario():
+        eng.direction = "long"
+        await eng._open_position()
+        eng.entropy.responses = [dict(status="filled", filled_base=.4),
+                                 dict(status="filled", filled_base=.6)]
+        original_record = eng._record
+        def broken_record(*args, **kwargs):
+            raise OSError("test log write failed")
+        eng._record = broken_record
+        with pytest.raises(OSError):
+            await eng._close_position()
+        eng._record = original_record
+        eng.entropy.set_book(98, 98.2)
+        await eng._close_position("shutdown")
+        assert eng.entropy.calls[1]["reference_px"] == eng.entropy.calls[2]["reference_px"]
+        assert eng.entropy.calls[1]["limit_px"] == eng.entropy.calls[2]["limit_px"]
+        assert eng.remaining == 0
     asyncio.run(scenario())

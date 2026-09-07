@@ -50,7 +50,9 @@ class Dashboard:
                    else self._t("virtual only", "仅虚拟腿"))
             books.add_row(venue.name, bbo, pos, "OK" if e._fresh(venue) else self._t("STALE", "超时"))
         order = e.virtual_order
-        virtual = (f"{order['leg']} {order['side']} @ {order['price']:g}" if order
+        virtual = (f"{order['leg']} {order['side']} "
+                   + self._t("depth", "档位") + f" {order.get('depth', e.cfg.virtual_depth)} "
+                   + f"@ {order['price']:g}" if order
                    else self._t("No virtual order", "暂无虚拟挂单"))
         status = Text(virtual + " | " + self._t("Entropy remaining", "Entropy 待平数量") + f" {e.remaining:g}")
         legs = Table(expand=True)
