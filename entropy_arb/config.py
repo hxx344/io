@@ -1,8 +1,9 @@
-"""Fixed RH virtual-maker / Entropy taker cycle configuration."""
+"""Entropy spread-gated timed market cycle configuration."""
 from __future__ import annotations
 
 import math
 import os
+import warnings
 from dataclasses import dataclass
 import yaml
 from dotenv import load_dotenv
@@ -51,11 +52,13 @@ class VenueConf:
 class Config:
     symbol: str
     entropy: VenueConf
-    hedge: VenueConf
+    hedge: VenueConf | None = None  # legacy construction compatibility; never connected
     hedge_venue: str = "lighter-rh"
     direction: str = "random"
     cycles: int = 0
-    virtual_depth: int = 4  # 1-based RH bid/ask book level
+    max_spread_bps: float = 2.0
+    close_delay_ms: float = 50.0
+    virtual_depth: int = 4  # legacy setting, ignored
     virtual_requote_sec: float = 3.0
     quantity: float = 0.0  # 0 sizes from order_notional
     order_notional: float = 50.0
@@ -70,7 +73,7 @@ class Config:
     retry_delay_sec: float = 1.0
     rate_limit_pause_sec: float = 10.0
     staleness_sec: float = 10.0
-    reconcile_sec: float = 15.0
+    reconcile_sec: float = 15.0  # legacy; position checks now follow each close
     http_keepalive_sec: float = 10.0
     max_hold_sec: float = 0.0
     recorder_enabled: bool = True
@@ -96,6 +99,8 @@ class ConfigError(ValueError):
 
 _SCHEMA = {
     "cycle": {"direction": ("direction", str), "cycles": ("cycles", int),
+              "max_spread_bps": ("max_spread_bps", float),
+              "close_delay_ms": ("close_delay_ms", float),
               "virtual_depth": ("virtual_depth", int),
               "virtual_requote_sec": ("virtual_requote_sec", float),
               "max_hold_sec": ("max_hold_sec", float), "state_file": ("state_file", str)},
@@ -154,17 +159,18 @@ def load_config(config_file="config.yaml", env_file=".env", *,
                     os.getenv("HL_ACCOUNT_ADDRESS", "").strip() or None)
     cfg = Config(symbol=symbol,
                  entropy=VenueConf("entropy", "hl", "ENTROPY", symbol, hl_creds=creds, **entropy_values),
-                 hedge=VenueConf("hedge", "lighter", "RH (virtual)", symbol,
-                                 lighter_profile=LIGHTER_PROFILES["lighter-rh"]), **values)
-    if cfg.direction not in ("long", "short", "random"):
-        raise ConfigError("cycle.direction must be long, short or random")
+                 **values)
+    if cfg.direction != "random":
+        raise ConfigError("cycle.direction is fixed to random")
+    if not 0 <= cfg.max_spread_bps < 10000:
+        raise ConfigError("max_spread_bps must be in [0, 10000)")
     for key in ("cycles", "quantity", "cooldown_sec", "max_hold_sec"):
         if getattr(cfg, key) < 0:
             raise ConfigError(f"{key} must be >= 0")
     for key in ("virtual_depth", "virtual_requote_sec", "order_notional", "max_order_notional",
                 "min_order_notional", "settle_timeout_sec", "max_order_attempts", "retry_delay_sec",
                 "rate_limit_pause_sec", "staleness_sec", "reconcile_sec", "http_keepalive_sec",
-                "status_interval_sec", "account_refresh_sec"):
+                "status_interval_sec", "account_refresh_sec", "close_delay_ms"):
         if getattr(cfg, key) <= 0:
             raise ConfigError(f"{key} must be > 0")
     for key in ("leg_slippage_bps", "leg2_slippage_bps", "leg4_slippage_bps"):
@@ -173,12 +179,15 @@ def load_config(config_file="config.yaml", env_file=".env", *,
             raise ConfigError(f"{key} must be in [0, 10000)")
     if not cfg.min_order_notional <= cfg.order_notional <= cfg.max_order_notional:
         raise ConfigError("min_order_notional <= order_notional <= max_order_notional required")
-    if cfg.entropy.cap_usd <= 0 or cfg.entropy.orders_per_min <= 0 or cfg.entropy.fee_bps < 0:
-        raise ConfigError("entropy cap/orders must be positive and fees nonnegative")
+    if cfg.entropy.cap_usd <= 0 or cfg.entropy.orders_per_min < 2 or cfg.entropy.fee_bps < 0:
+        raise ConfigError("entropy cap must be positive, orders_per_min >= 2, and fees nonnegative")
     for key in ("state_file", "trades_csv", "recorder_csv", "log_file"):
         if not getattr(cfg, key).strip():
             raise ConfigError(f"{key} must not be empty")
     cfg.log_level = cfg.log_level.upper()
     if cfg.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         raise ConfigError("invalid logging.level")
+    for key in ("virtual_depth", "virtual_requote_sec", "max_hold_sec"):
+        if key in raw.get("cycle", {}):
+            warnings.warn(f"cycle.{key} is ignored by the Entropy-only strategy", stacklevel=2)
     return cfg

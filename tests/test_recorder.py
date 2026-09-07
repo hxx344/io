@@ -82,6 +82,23 @@ def test_append_keeps_single_header():
     assert lines[0].startswith("minute_ts,")
 
 
+def test_entropy_only_records_without_hedge_or_invented_premiums(tmp_path):
+    book = OrderBook()
+    set_book(book, 99.99, 100.01)
+    path = tmp_path / "entropy.csv"
+    rec = MinuteRecorder(str(path), book, None, staleness_sec=10)
+    rec.sample(1_700_000_000)
+    rec.close()
+    with path.open(newline="") as fh:
+        row = next(csv.DictReader(fh))
+    assert row["entropy_bid"] == "99.99" and row["entropy_ask"] == "100.01"
+    assert row["hedge_bid"] == row["premium_mean_bps"] == ""
+    assert row["samples"] == "1" and None not in row
+    from tools.analyze import load_rows
+    rows = load_rows(str(path), hours=0, min_samples=1)
+    assert len(rows) == 1 and abs(rows[0]["spread"] - 2) < 1e-9
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

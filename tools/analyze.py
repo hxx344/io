@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Describe recorded public minute prices.
-
-Historical premium statistics do not model virtual-maker triggers, Entropy
-fills, or cycle PnL. This tool emits no strategy configuration.
-"""
+"""Describe Entropy bid/ask spreads from recorded minute-close prices."""
 from __future__ import annotations
 
 import argparse
@@ -37,20 +33,18 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
                     continue
                 if int(r["samples"]) < min_samples:
                     continue
-                rows.append({
-                    "ts": float(r["minute_ts"]),
-                    "prem": float(r["premium_close_bps"]),
-                    "prem_mean": float(r["premium_mean_bps"]),
-                    "sell_max": float(r["sell_edge_max_bps"]),
-                    "buy_max": float(r["buy_edge_max_bps"]),
-                })
+                bid, ask = float(r["entropy_bid"]), float(r["entropy_ask"])
+                if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid < ask):
+                    continue
+                rows.append({"ts": float(r["minute_ts"]),
+                             "spread": (ask - bid) / ((ask + bid) / 2) * 10000})
             except (KeyError, ValueError):
                 continue
     return rows
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="describe premiums from recorded "
+    p = argparse.ArgumentParser(description="describe Entropy spreads from recorded "
                                             "minute data")
     p.add_argument("--csv", default="logs/minutes.csv")
     p.add_argument("--hours", type=float, default=0.0,
@@ -74,20 +68,20 @@ def main() -> None:
             sys.exit(1)
 
     span_h = (rows[-1]["ts"] - rows[0]["ts"]) / 3600.0 + 1 / 60.0
-    prem = sorted(r["prem"] for r in rows)
+    prem = sorted(r["spread"] for r in rows)
     mean = sum(prem) / len(prem)
     var = sum((x - mean) ** 2 for x in prem) / len(prem)
     median = pctl(prem, 50)
 
     print(f"\n=== {args.csv}: {len(rows)} minutes over {span_h:.1f}h ===\n")
-    print("premium of Entropy over hedge, minute close (bps) / "
-          "Entropy 相对对冲腿的溢价:")
+    print("Entropy bid/ask spread, minute close (bps) / "
+          "Entropy 买一卖一价差:")
     print(f"  mean {mean:+.2f}   std {math.sqrt(var):.2f}   "
           f"median {median:+.2f}")
     print(f"  p5 {pctl(prem, 5):+.2f}   p25 {pctl(prem, 25):+.2f}   "
           f"p75 {pctl(prem, 75):+.2f}   p95 {pctl(prem, 95):+.2f}")
 
-    print("\nDescriptive prices only; these premiums are not 4LEG triggers or cycle PnL.")
+    print("\nMinute-close statistics only; not continuous spread coverage or cycle PnL.")
 
 
 if __name__ == "__main__":

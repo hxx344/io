@@ -1,9 +1,6 @@
-"""One-minute public order-book recorder.
+"""Minute BBO recorder; optional legacy comparison book.
 
-Both books are sampled once per second. The existing CSV schema is retained:
-hedge_* columns now refer to Lighter RH public reference prices. Premium and
-sell/buy edge columns are descriptive cross-venue statistics, not four-leg
-entry signals or estimates of scalping PnL. Only fresh books are sampled.
+Entropy-only mode keeps the CSV header but leaves all hedge/premium fields empty.
 """
 from __future__ import annotations
 
@@ -44,7 +41,12 @@ class _MinuteAgg:
         self.b_max = -math.inf
         self.e_bid = self.e_ask = self.h_bid = self.h_ask = 0.0
 
-    def add(self, e_bid: float, e_ask: float, h_bid: float, h_ask: float) -> None:
+    def add(self, e_bid: float, e_ask: float, h_bid: Optional[float], h_ask: Optional[float]) -> None:
+        if h_bid is None:
+            self.n += 1
+            self.e_bid, self.e_ask = e_bid, e_ask
+            self.h_bid = self.h_ask = None
+            return
         e_mid = (e_bid + e_ask) / 2.0
         h_mid = (h_bid + h_ask) / 2.0
         prem = (e_mid / h_mid - 1.0) * 1e4
@@ -65,6 +67,10 @@ class _MinuteAgg:
         self.e_bid, self.e_ask, self.h_bid, self.h_ask = e_bid, e_ask, h_bid, h_ask
 
     def row(self) -> list:
+        if self.h_bid is None:
+            ts = self.minute * 60
+            return [ts, datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    f"{self.e_bid:.10g}", f"{self.e_ask:.10g}"] + [""] * 12 + [self.n]
         mean = self.p_sum / self.n
         var = max(self.p_sumsq / self.n - mean * mean, 0.0)
         ts = self.minute * 60
@@ -82,7 +88,7 @@ class _MinuteAgg:
 
 
 class MinuteRecorder:
-    def __init__(self, path: str, entropy_book: OrderBook, hedge_book: OrderBook,
+    def __init__(self, path: str, entropy_book: OrderBook, hedge_book: Optional[OrderBook],
                  staleness_sec: float, interval_sec: float = 1.0) -> None:
         self.path = path
         self.entropy_book = entropy_book
@@ -131,11 +137,12 @@ class MinuteRecorder:
         if self._agg is not None and self._agg.minute != minute:
             self._flush_agg()
         if not (self.entropy_book.is_fresh(self.staleness_sec)
-                and self.hedge_book.is_fresh(self.staleness_sec)):
+                and (self.hedge_book is None or self.hedge_book.is_fresh(self.staleness_sec))):
             return
         e_bid, e_ask = self.entropy_book.best_bid(), self.entropy_book.best_ask()
-        h_bid, h_ask = self.hedge_book.best_bid(), self.hedge_book.best_ask()
-        if None in (e_bid, e_ask, h_bid, h_ask):
+        h_bid, h_ask = ((self.hedge_book.best_bid(), self.hedge_book.best_ask())
+                        if self.hedge_book is not None else (None, None))
+        if not all(p is not None and math.isfinite(p) and p > 0 for p in (e_bid, e_ask)) or e_bid >= e_ask:
             return
         if self._agg is None:
             self._agg = _MinuteAgg(minute)

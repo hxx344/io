@@ -14,15 +14,15 @@ def test_startup(eng):
     assert "resolving markets" in render(eng)
 
 
-def test_four_leg_display(eng):
+def test_entropy_spread_and_timed_close_display(eng):
     eng.markets_ready = True
-    eng.state, eng.direction, eng.remaining = "LEG3", "long", 1
-    eng.virtual_order = dict(leg="LEG3", side="buy", price=99.98)
+    eng.state, eng.direction, eng.remaining = "WAIT_CLOSE", "long", 1
     text = render(eng)
-    for word in ("4LEG", "LIVE", "LEG3", "virtual only", "99.98", "Entropy remaining 1"):
+    for word in ("LEG2 → LEG4", "LIVE", "WAIT_CLOSE", "Close delay 50ms", "Entropy remaining 1"):
         assert word in text
+    assert "Lighter" not in text and "virtual" not in text
     text = render(eng, "zh")
-    for word in ("实盘", "仅虚拟腿", "待平数量", "买一 / 卖一"):
+    for word in ("实盘", "买卖价差", "平仓延迟 50ms", "待平数量", "买一 / 卖一"):
         assert word in text
 
 

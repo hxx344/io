@@ -14,11 +14,12 @@ def load(tmp_path, monkeypatch):
     return read
 
 
-def test_default_random_fixed_rh(load):
+def test_default_entropy_only(load):
     cfg = load()
     assert cfg.direction == "random"
     assert cfg.hedge_venue == "lighter-rh"
-    assert cfg.hedge.lighter_profile.chain_id == 466324
+    assert cfg.hedge is None
+    assert cfg.max_spread_bps == 2 and cfg.close_delay_ms == 50
     assert cfg.entropy.hl_dex == "io"
     assert not cfg.creds_complete
 
@@ -32,10 +33,14 @@ def test_only_entropy_credentials_required(load, monkeypatch):
 def test_example():
     path = Path(__file__).resolve().parents[1] / "config.example.yaml"
     cfg = load_config(str(path), "missing.env", symbol="SNDK")
-    assert cfg.direction == "random" and cfg.virtual_depth == 4
+    assert cfg.direction == "random" and cfg.max_spread_bps == 2 and cfg.close_delay_ms == 50
 
 
 @pytest.mark.parametrize("text", [
+    "cycle: {max_spread_bps: -1}", "cycle: {max_spread_bps: .nan}",
+    "cycle: {max_spread_bps: 10000}", "cycle: {close_delay_ms: 0}",
+    "cycle: {close_delay_ms: -1}", "cycle: {close_delay_ms: .inf}",
+    "cycle: {direction: long}", "entropy: {max_orders_per_min: 1}",
     "thresholds: {midline_bps: 0}", "hedge: {taker_fee_bps: 0}",
     "entropy: {dex: xyz}", "cycle: {direction: buy}", "cycle: {cycles: -1}",
     "cycle: {cycles: true}", "cycle: {virtual_depth: 0}",
@@ -64,12 +69,18 @@ def test_invalid_per_leg_slippage(load, key, value):
         load(f"execution: {{{key}: {value}}}")
 
 
-def test_depth_and_independent_slippage_config(load):
-    cfg = load("cycle: {virtual_depth: 8}\nexecution: {leg2_slippage_bps: 12, leg4_slippage_bps: 25}")
-    assert cfg.virtual_depth == 8
+def test_spread_delay_and_independent_slippage_config(load):
+    cfg = load("cycle: {max_spread_bps: 3, close_delay_ms: 60}\nexecution: {leg2_slippage_bps: 12, leg4_slippage_bps: 25}")
+    assert cfg.max_spread_bps == 3 and cfg.close_delay_ms == 60
     assert cfg.leg2_slippage_bps == 12 and cfg.leg4_slippage_bps == 25
 
 
 def test_old_virtual_offset_requires_migration(load):
     with pytest.raises(ConfigError, match="virtual_offset_bps"):
         load("cycle: {virtual_offset_bps: 2}")
+
+
+def test_legacy_virtual_config_warns_without_enabling_rh(load):
+    with pytest.warns(UserWarning, match="ignored"):
+        cfg = load("cycle: {virtual_depth: 4, virtual_requote_sec: 3, max_hold_sec: 0}")
+    assert cfg.hedge is None and cfg.max_spread_bps == 2 and cfg.close_delay_ms == 50

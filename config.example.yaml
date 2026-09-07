@@ -1,11 +1,10 @@
-# Fixed four legs: RH virtual -> Entropy market open -> RH virtual -> market reduce-only close.
+# Entropy only: spread gate -> random LEG2 market entry -> timed LEG4 reduce-only exit.
 cycle:
-  direction: random            # random (50/50 each cycle), long, short
+  direction: random            # fixed: independently random long/short each cycle
   cycles: 0                    # 0 = repeat until stopped
-  virtual_depth: 4              # 1-based depth: virtual buy at bid N, virtual sell at ask N
-  virtual_requote_sec: 3.0      # fixed limit until touched or timeout; then re-arm
-  max_hold_sec: 0.0             # 0 = wait for LEG3; >0 = close after this many seconds
-  state_file: logs/cycle.json   # keep between restarts; also used for process locking
+  max_spread_bps: 2.0           # (ask - bid) / mid * 10000 <= this threshold
+  close_delay_ms: 50.0          # from the filled LEG2 attempt's submission
+  state_file: logs/cycle.json
 
 entropy:
   dex: io
@@ -28,7 +27,6 @@ execution:
   retry_delay_sec: 1.0
   rate_limit_pause_sec: 10.0
   staleness_sec: 10.0
-  reconcile_sec: 15.0
   http_keepalive_sec: 10.0
 
 recorder:

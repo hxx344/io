@@ -1,4 +1,4 @@
-"""Compact four-leg execution dashboard, English or Chinese."""
+"""Entropy spread and timed-exit dashboard, English or Chinese."""
 from __future__ import annotations
 import asyncio
 import logging
@@ -33,7 +33,7 @@ class Dashboard:
     def _safe_render(self):
         e = self.engine
         mode = self._t("RECORD-ONLY", "仅采集") if e.record_only else self._t("LIVE", "实盘")
-        title = f"4LEG | Lighter RH → Entropy | {e.cfg.symbol} | {mode}"
+        title = f"Entropy | LEG2 → LEG4 | {e.cfg.symbol} | {mode}"
         if not e.markets_ready:
             return Panel(self._t("starting — resolving markets", "启动中：正在解析市场"), title=title)
         state = Text(f"{e.state} | " + self._t("cycle", "轮次") + f" {e.cycle} | "
@@ -47,15 +47,14 @@ class Dashboard:
         for venue in e.venues.values():
             bid, ask = venue.book.best_bid(), venue.book.best_ask()
             bbo = f"{bid:g} / {ask:g}" if bid and ask else "—"
-            pos = (f"{venue.position:+g}" if venue.key == "entropy"
-                   else self._t("virtual only", "仅虚拟腿"))
+            pos = f"{venue.position:+g}"
             books.add_row(venue.name, bbo, pos, "OK" if e._fresh(venue) else self._t("STALE", "超时"))
-        order = e.virtual_order
-        virtual = (f"{order['leg']} {order['side']} "
-                   + self._t("depth", "档位") + f" {order.get('depth', e.cfg.virtual_depth)} "
-                   + f"@ {order['price']:g}" if order
-                   else self._t("No virtual order", "暂无虚拟挂单"))
-        status = Text(virtual + " | " + self._t("Entropy remaining", "Entropy 待平数量") + f" {e.remaining:g}")
+        spread = e.spread_bps()
+        spread_text = f"{spread:.3f} bps" if spread is not None else "—"
+        status = Text(self._t("BBO spread", "买卖价差") + f" {spread_text} / "
+                      + self._t("threshold", "阈值") + f" {e.cfg.max_spread_bps:g} bps | "
+                      + self._t("Close delay", "平仓延迟") + f" {e.cfg.close_delay_ms:g}ms | "
+                      + self._t("Entropy remaining", "Entropy 待平数量") + f" {e.remaining:g}")
         stats = e.account_stats
         account = Text(self._t("Entropy balance", "Entropy 余额") + " | ")
         snap = stats.snapshot

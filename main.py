@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Fixed four-leg RH/Entropy entry point.
+"""Entropy spread-gated random entry and timed reduce-only exit.
 
     python main.py --record-only --symbol SNDK
     python main.py --symbol SNDK --cn
-
-Config: config.yaml. Credentials: .env (Entropy only).
-RH is always virtual. Default direction is randomized once per cycle.
 """
 import argparse
 import asyncio
@@ -68,15 +65,14 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Fixed 4LEG: Lighter RH virtual depth entry -> Entropy market open -> "
-                    "Lighter RH virtual depth exit -> Entropy market reduce-only close. "
-                    "Each cycle randomly chooses long/short by default.")
+        description="Entropy BBO spread within threshold -> random LEG2 market entry "
+                    "-> LEG4 reduce-only market exit after 50ms.")
     p.add_argument("--symbol", required=True,
-                   help="symbol traded on both venues, e.g. SNDK / "
-                        "两个交易所共同交易的品种")
+                   help="Entropy symbol, e.g. SNDK / "
+                        "Entropy 交易品种")
     p.add_argument("--hedge", default="lighter-rh", choices=HEDGE_VENUES,
                    metavar="VENUE",
-                   help="fixed virtual reference: lighter-rh (default)")
+                   help="deprecated compatibility option; Lighter RH is not connected")
     p.add_argument("--config", default="config.yaml",
                    help="strategy config (default: config.yaml)")
     p.add_argument("--env-file", default=".env",

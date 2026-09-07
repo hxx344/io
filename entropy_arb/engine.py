@@ -1,4 +1,4 @@
-"""Sequential four-leg scalping: virtual RH -> real Entropy -> virtual RH -> close."""
+"""Entropy spread-gated random entry followed by a timed reduce-only exit."""
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +19,6 @@ from .config import Config
 from .journal import CycleJournal
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
-from .venue_lighter import LighterVenue
 
 log = logging.getLogger("engine")
 CSV_HEADER = ["ts", "cycle", "direction", "leg", "venue", "side", "virtual",
@@ -29,7 +28,7 @@ CSV_HEADER = ["ts", "cycle", "direction", "leg", "venue", "side", "virtual",
 class Engine:
     def __init__(self, cfg: Config, record_only=False):
         self.cfg, self.record_only = cfg, record_only
-        self.entropy = self.hedge = self.session = None
+        self.entropy = self.session = None
         self.venues = {}
         self.stop = asyncio.Event()
         self.finished = asyncio.Event()
@@ -43,7 +42,6 @@ class Engine:
         self.direction = ""
         self.cycle = self.completed_cycles = 0
         self.remaining = 0.0
-        self.virtual_order = None
         self.recent_trades = deque(maxlen=50)
         self._sends = deque()
         self._limited_until = 0.0
@@ -51,7 +49,7 @@ class Engine:
         self._journal = CycleJournal(cfg.state_file)
         self._step = 0.0001
         self._last_reconcile = 0.0
-        self._exposure_since = 0.0
+        self._entry_sent_at = None
         self._market_references = {}
         self.turnover = {"LEG2": Decimal(0), "LEG4": Decimal(0)}
         self.unpriced_filled = {"LEG2": Decimal(0), "LEG4": Decimal(0)}
@@ -114,14 +112,13 @@ class Engine:
         try:
             if not self.record_only:
                 if not self.cfg.creds_complete:
-                    raise RuntimeError("Entropy HL_PRIVATE_KEY required; RH needs no credentials")
+                    raise RuntimeError("Entropy HL_PRIVATE_KEY required")
                 self._journal.acquire()
                 self._journal.check_clean()
             self.entropy = HLVenue(self.cfg.entropy, self.cfg.hl_api_url,
                                    self.cfg.hl_ws_url, self.session, self.cfg.settle_timeout_sec)
-            self.hedge = LighterVenue(self.cfg.hedge, self.session)
-            self.venues = {"entropy": self.entropy, "hedge": self.hedge}
-            await asyncio.gather(self.entropy.load_market(), self.hedge.load_market())
+            self.venues = {"entropy": self.entropy}
+            await self.entropy.load_market()
             self._step = 10 ** -self.entropy.size_decimals
             self.markets_ready = True
             if not self.record_only:
@@ -137,7 +134,7 @@ class Engine:
                 tasks += venue.start_tasks(self._feed_stop, self._update_evt.set, live=False)
             if self.cfg.recorder_enabled or self.record_only:
                 self.recorder = MinuteRecorder(self.cfg.recorder_csv, self.entropy.book,
-                                               self.hedge.book, self.cfg.staleness_sec)
+                                               None, self.cfg.staleness_sec)
                 tasks.append(asyncio.create_task(self.recorder.run(self._feed_stop)))
             tasks.append(asyncio.create_task(self._status_loop()))
             if self.record_only:
@@ -215,10 +212,6 @@ class Engine:
     def _signed_remaining(self):
         return self.remaining if self.direction == "long" else -self.remaining
 
-    async def _check_position_due(self):
-        if time.monotonic() - self._last_reconcile >= self.cfg.reconcile_sec:
-            await self._confirm_position(self._signed_remaining())
-
     def _record(self, leg, side, virtual, qty, filled, limit, avg, status, reason=""):
         row = dict(zip(CSV_HEADER, [time.time(), self.cycle, self.direction, leg,
                        "lighter-rh" if virtual else "entropy", side, virtual,
@@ -237,60 +230,16 @@ class Engine:
                  self.cycle, leg, "VIRTUAL" if virtual else "ENTROPY", side,
                  filled, qty, limit, status, reason)
 
-    async def _wait_virtual(self, leg, is_buy, qty):
-        self.state = leg
-        self._save()
-        self.virtual_order = None
-        while not self.stop.is_set():
-            await self._check_position_due()
-            if leg == "LEG3" and self.cfg.max_hold_sec > 0:
-                if time.monotonic() - self._exposure_since >= self.cfg.max_hold_sec:
-                    self.virtual_order = None
-                    return False
-            if not self._fresh(self.hedge) or not self._fresh(self.entropy):
-                self.virtual_order = None
-                await self._pulse()
-                continue
-            book = self.hedge.book
-            now = time.monotonic()
-            if self.virtual_order is not None:
-                order = self.virtual_order
-                if book.generation != order["generation"]:
-                    self.virtual_order = None
-                    continue
-                # Only a later RH book update can fill a newly armed virtual order.
-                crossed = (book.best_ask() <= order["price"] if is_buy
-                           else book.best_bid() >= order["price"])
-                if now < order["expires"] and book.revision > order["revision"] and crossed:
-                    avg = book.best_ask() if is_buy else book.best_bid()
-                    self._record(leg, "buy" if is_buy else "sell", True, order["qty"], order["qty"],
-                                 order["price"], avg, "VIRTUAL_FILLED")
-                    self.virtual_order = None
-                    return True
-                if now < order["expires"]:
-                    await self._pulse()
-                    continue
-            # Use the actual Nth price level, not a BBO percentage offset.
-            levels = book.sorted_bids() if is_buy else book.sorted_asks()
-            levels = [(px, size) for px, size in levels
-                      if math.isfinite(px) and px > 0 and math.isfinite(size) and size > 0]
-            if len(levels) < self.cfg.virtual_depth:
-                self.virtual_order = None
-                await self._pulse()
-                continue
-            price = levels[self.cfg.virtual_depth - 1][0]
-            self.virtual_order = {"leg": leg, "side": "buy" if is_buy else "sell",
-                                  "price": price, "revision": book.revision,
-                                  "generation": book.generation,
-                                  "depth": self.cfg.virtual_depth,
-                                  "qty": qty or self._entry_quantity(self.direction == "long"),
-                                  "expires": now + self.cfg.virtual_requote_sec}
-            log.info("cycle=%d %s RH virtual %s depth=%d qty=%g limit=%g", self.cycle, leg,
-                     self.virtual_order["side"], self.cfg.virtual_depth,
-                     self.virtual_order["qty"], price)
-            await self._pulse()
-        self.virtual_order = None
-        return False
+    def spread_bps(self):
+        if not self._fresh(self.entropy):
+            return None
+        bid = Decimal(str(self.entropy.book.best_bid()))
+        ask = Decimal(str(self.entropy.book.best_ask()))
+        return float((ask - bid) / ((ask + bid) / 2) * 10000)
+
+    def _spread_allowed(self):
+        spread = self.spread_bps()
+        return spread is not None and spread <= self.cfg.max_spread_bps
 
     def _slippage(self, leg):
         override = self.cfg.leg2_slippage_bps if leg == "LEG2" else self.cfg.leg4_slippage_bps
@@ -320,7 +269,7 @@ class Engine:
         return qty
 
     async def _wait_send_ready(self, closing):
-        # Exit may proceed without RH, including after a stop request.
+        # Entry reserves one order slot for the timed exit; exits ignore spread.
         deadline = time.monotonic() + max(self.cfg.staleness_sec, 65.0)
         while True:
             if not closing and self.stop.is_set():
@@ -328,11 +277,13 @@ class Engine:
             now = time.monotonic()
             while self._sends and now - self._sends[0] >= 60:
                 self._sends.popleft()
-            if (self._fresh(self.entropy) and (closing or self._fresh(self.hedge))
-                    and len(self._sends) < self.cfg.entropy.orders_per_min
+            self.state = "LEG4" if closing else "WAIT_SPREAD"
+            needed = 1 if closing else 2
+            if (self._fresh(self.entropy) and (closing or self._spread_allowed())
+                    and len(self._sends) + needed <= self.cfg.entropy.orders_per_min
                     and now >= self._limited_until):
                 return True
-            if now >= deadline:
+            if closing and now >= deadline:
                 self._halt("Timed out waiting for fresh Entropy book/order budget")
             await self._pulse()
 
@@ -344,6 +295,11 @@ class Engine:
         self._save()
         self._sends.append(time.monotonic())
         limit = self._limit(is_buy, reference_px, leg)
+        if leg == "LEG2":
+            self._entry_sent_at = time.monotonic()
+        elif self._entry_sent_at is not None:
+            log.info("LEG4 elapsed_since_entry_ms=%.3f target_ms=%g",
+                     (time.monotonic() - self._entry_sent_at) * 1000, self.cfg.close_delay_ms)
         try:
             result = await self.entropy.send_market(is_buy=is_buy, qty=qty,
                 reference_px=reference_px, slippage_bps=self._slippage(leg), reduce_only=closing)
@@ -361,7 +317,10 @@ class Engine:
         self._account_turnover(leg, filled, result.get("avg_px"))
         self.state = leg
         self._save()
-        await self._confirm_position(self._signed_remaining())
+        # The exchange fill acknowledgement owns size; no REST round-trip between legs.
+        self.entropy.position = self._signed_remaining()
+        if closing:
+            await self._confirm_position(self._signed_remaining())
         self._record(leg, "buy" if is_buy else "sell", False, qty, filled,
                      limit, result.get("avg_px"), result.get("status", "unknown"), reason)
         if "RATE_LIMITED" in str(result.get("err", "")):
@@ -379,30 +338,26 @@ class Engine:
             await self._confirm_position(0.0)
             if not await self._wait_send_ready(closing=False):
                 return False
-            # Size is recomputed at the executable Entropy price after the virtual trigger.
+            # Recheck the spread after every awaited position query and retry.
             if reference_px is None:
                 reference_px = self._market_reference(is_buy)
                 self._market_references["LEG2"] = reference_px
             qty = self._entry_quantity(is_buy, reference_px)
             filled = await self._send("LEG2", is_buy, qty, closing=False, reference_px=reference_px)
             if filled > 0:
-                self._exposure_since = time.monotonic()
                 return True  # partial entry accepted, never top up blindly
             if attempt + 1 < self.cfg.max_order_attempts:
                 await self._delay(self.cfg.retry_delay_sec)
         self._halt("LEG2 exhausted attempts without a fill")
 
-    async def _close_position(self, reason="trigger"):
+    async def _close_position(self, reason="timer"):
         reference_px = self._market_references.get("LEG4")
-        self.virtual_order = None
         self.state = "LEG4"
         self._save()
         for attempt in range(self.cfg.max_order_attempts):
             if self.remaining < self._step / 2:
                 await self._confirm_position(0.0)
                 return
-            await self._wait_send_ready(closing=True)
-            await self._confirm_position(self._signed_remaining())
             await self._wait_send_ready(closing=True)
             qty = floor_step(self.remaining, self._step)
             if qty < self._step:
@@ -433,18 +388,15 @@ class Engine:
                 await self._confirm_position(0.0)
                 self.cycle += 1
                 self._market_references.clear()
-                self.direction = (self._rng.choice(("long", "short"))
-                                  if self.cfg.direction == "random" else self.cfg.direction)
-                self.state = "LEG1"
-                self._save()
-                # Long = virtual sell above market -> Entropy buy; short mirrors it.
-                if not await self._wait_virtual("LEG1", self.direction == "short", self.cfg.quantity):
-                    break
+                self.direction = self._rng.choice(("long", "short"))
+                self._entry_sent_at = None
                 if not await self._open_position():
                     break
-                triggered = await self._wait_virtual("LEG3", self.direction == "long", self.remaining)
-                reason = "trigger" if triggered else "shutdown" if self.stop.is_set() else "max_hold"
-                await self._close_position(reason)
+                self.state = "WAIT_CLOSE"
+                self._save()
+                deadline = self._entry_sent_at + self.cfg.close_delay_ms / 1000
+                await self._delay(max(0, deadline - time.monotonic()))
+                await self._close_position("shutdown" if self.stop.is_set() else "timer")
                 self.completed_cycles += 1
                 self.state = "IDLE"
                 self._save()
@@ -465,7 +417,7 @@ class Engine:
 
     async def _status_loop(self):
         while not self._feed_stop.is_set():
-            log.info("4LEG state=%s cycle=%d completed=%d direction=%s Entropy remaining=%g",
+            log.info("Entropy state=%s cycle=%d completed=%d direction=%s Entropy remaining=%g",
                      self.state, self.cycle, self.completed_cycles, self.direction, self.remaining)
             self._log_turnover()
             await asyncio.sleep(self.cfg.status_interval_sec)
